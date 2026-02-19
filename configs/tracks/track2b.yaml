@@ -1,0 +1,3 @@
+# Track 2B — Damage-map aggregation
+index_csv: data/processed/index.csv
+diff_threshold: 25.0

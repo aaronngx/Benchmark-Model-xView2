@@ -1,0 +1,15 @@
+# Default config for wildfire damage benchmark
+dataset_root: data/raw/test_images_labels_targets
+index_csv: data/processed/index.csv
+crops_oracle: data/processed/crops_oracle
+pred_instances: data/processed/pred_instances
+runs_dir: runs
+
+# Track 1 placeholder (no model)
+placeholder_damage: no-damage
+
+# Track 2A change threshold
+diff_threshold: 25.0
+
+# Track 3 guardrails
+min_confidence: 0.3

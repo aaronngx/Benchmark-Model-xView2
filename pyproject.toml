@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "disaster-bench"
+version = "0.1.0"
+description = "SoCal wildfire building damage benchmark — Tracks 1/2A/2B/3"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy",
+    "opencv-python",
+    "shapely",
+    "pillow",
+]
+
+[project.optional-dependencies]
+ml = ["torch", "torchvision", "timm"]
+config = ["pyyaml", "pydantic"]
+
+[project.scripts]
+disaster-bench = "disaster_bench.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

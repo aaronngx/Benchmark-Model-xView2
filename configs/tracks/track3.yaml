@@ -1,0 +1,4 @@
+# Track 3 — Hybrid guardrails
+index_csv: data/processed/index.csv
+placeholder_damage: no-damage
+min_confidence: 0.3
