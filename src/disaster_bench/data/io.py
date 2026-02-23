@@ -129,7 +129,7 @@ def get_buildings_from_label(label_data: dict[str, Any], use_xy: bool = True) ->
     for feat in features:
         props = feat.get("properties", {})
         uid = props.get("uid", "")
-        subtype = props.get("subtype", "")
+        subtype = props["subtype"]
         wkt = feat.get("wkt", "")
         if uid and wkt:
             out.append({"uid": uid, "subtype": subtype, "wkt": wkt})
