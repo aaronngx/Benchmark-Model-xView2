@@ -1,0 +1,5 @@
+model_ckpt:        models/siamese_unet/best.pt
+device:            cuda
+input_size:        256
+inference_batch:   16
+crops_dir:         data/processed/crops_oracle
