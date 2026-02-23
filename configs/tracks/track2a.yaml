@@ -1,3 +1,7 @@
-# Track 2A — Unsupervised numeric baseline
 index_csv: data/processed/index.csv
+# Binary diff threshold (pixel value 0-255)
 diff_threshold: 25.0
+# Building-level % changed -> damage class thresholds
+thresh_minor: 8.0
+thresh_major: 25.0
+thresh_destroyed: 55.0

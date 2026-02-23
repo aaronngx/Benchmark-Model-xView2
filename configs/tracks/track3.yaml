@@ -1,4 +1,10 @@
-# Track 3 — Hybrid guardrails
 index_csv: data/processed/index.csv
-placeholder_damage: no-damage
-min_confidence: 0.3
+model_ckpt: "models/six_channel/best.pt"
+crops_dir: data/processed/crops_oracle
+input_size: 128
+device: cuda
+inference_batch: 128
+# Guardrail thresholds
+strong_thresh: 0.4
+low_thresh: 0.05
+min_confidence: 0.35

@@ -1,3 +1,8 @@
-# Track 1 — End-to-End ML
 index_csv: data/processed/index.csv
+# Path to trained 6-channel classifier checkpoint (set after training)
+model_ckpt: "models/six_channel/best.pt"
+crops_dir: data/processed/crops_oracle
+input_size: 128
+device: cuda
+inference_batch: 128
 placeholder_damage: no-damage

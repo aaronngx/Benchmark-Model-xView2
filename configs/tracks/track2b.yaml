@@ -1,3 +1,9 @@
-# Track 2B — Damage-map aggregation
 index_csv: data/processed/index.csv
-diff_threshold: 25.0
+# Pixel-severity signal thresholds (pixel value 0-255)
+pix_minor: 15.0
+pix_major: 25.0
+pix_destroyed: 55.0
+# Building-level % damaged pixel thresholds
+thresh_minor: 10.0
+thresh_major: 30.0
+thresh_destroyed: 60.0

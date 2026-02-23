@@ -1,0 +1,8 @@
+# Track 1 — Pre/Post/Diff classifier (9-channel)
+# Ref §2.1: "Pre/Post/Diff classifier"
+model_type:       pre_post_diff
+model_ckpt:       models/pre_post_diff/best.pt
+device:           cuda
+input_size:       128
+inference_batch:  64
+crops_dir:        data/processed/crops_oracle

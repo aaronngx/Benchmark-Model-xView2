@@ -1,0 +1,12 @@
+# Track 1 — Real deployment (predicted footprints, not oracle)
+# Ref §A2: Footprint detection stage → damage classification
+# model_ckpt:      damage classifier checkpoint
+# footprint_ckpt:  U-Net footprint detector (train with scripts/train_footprint.py)
+model_ckpt:             models/six_channel/best.pt
+footprint_ckpt:         models/footprint_unet/best.pt   # train with: python scripts/train_footprint_unet.py
+device:                 cuda
+input_size:             128
+inference_batch:        64
+match_iou_threshold:    0.2
+save_pred_instances:    true
+pred_instances_dir:     data/processed/pred_instances

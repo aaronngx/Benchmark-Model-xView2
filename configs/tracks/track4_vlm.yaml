@@ -1,0 +1,8 @@
+# Track 4 — VLM benchmark (images-only, ungrounded)
+# Uses GitHub Models API. Set GITHUB_TOKEN in .env.
+# Model IDs: run list_github_models() to see what's available for your account.
+model:             openai/gpt-4o
+grounded:          false
+crops_dir:         data/processed/crops_oracle
+vlm_input_size:    512             # resize crops before sending (0 = natural resolution)
+max_crops:         200             # cap for rate-limit-aware trials; null = all

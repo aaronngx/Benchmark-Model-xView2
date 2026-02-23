@@ -35,11 +35,18 @@ ENV/
 .env
 .env.local
 
-# Data (keep structure, ignore large/raw if desired)
-data/processed/index.csv
-data/processed/crops_oracle/
-data/processed/pred_instances/
+# Data & generated artifacts (too large for GitHub)
+data/
+models/
+logs/
+plots/
 runs/
+
+# Claude Code session files
+.claude/
+
+# Reference/notes folder
+ref/
 
 # OS
 .DS_Store

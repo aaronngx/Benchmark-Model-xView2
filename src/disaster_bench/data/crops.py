@@ -5,10 +5,10 @@ Also supports cropping from predicted bboxes/masks (for tracks).
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw
+from shapely.geometry import Polygon
 
 from disaster_bench.data.io import (
     get_buildings_from_label,
@@ -21,7 +21,32 @@ from disaster_bench.data.polygons import (
     scale_factors,
 )
 from disaster_bench.data.rasterize import mask_to_bbox, rasterize_polygon
-from shapely.geometry import Polygon
+
+
+def _translate_polygon(poly: Polygon, dx: float, dy: float) -> Polygon:
+    """Shift a polygon by (dx, dy) — maps image-space coords into padded-crop-local coords."""
+    from shapely import affinity
+    return affinity.translate(poly, xoff=dx, yoff=dy)
+
+
+def _draw_polygon_outline(
+    crop: np.ndarray,
+    poly: Polygon,
+    color: tuple[int, int, int] = (255, 60, 60),
+    line_width: int = 2,
+) -> np.ndarray:
+    """
+    Draw a thin polygon outline on a uint8 RGB crop using PIL.
+    Polygon coordinates must already be in crop-local pixel space.
+    Returns a new array (does not modify crop in-place).
+    """
+    img = Image.fromarray(crop.astype(np.uint8))
+    draw = ImageDraw.Draw(img)
+    coords = [(float(x), float(y)) for x, y in poly.exterior.coords]
+    n = len(coords)
+    for i in range(n):
+        draw.line([coords[i], coords[(i + 1) % n]], fill=color, width=line_width)
+    return np.array(img)
 
 
 def make_oracle_crops_for_tile(
@@ -31,13 +56,21 @@ def make_oracle_crops_for_tile(
     label_json_path: str | Path,
     out_dir: str | Path,
     *,
-    save_masked: bool = False,
+    pad_fraction: float = 0.25,
 ) -> int:
     """
     For one tile: load pre/post images and post label JSON; for each building
-    parse WKT (xy), scale to image if needed, rasterize, bbox, crop pre and post;
-    save to out_dir/tile_id/uid/pre_bbox.png, post_bbox.png.
-    Returns number of buildings (uid) written.
+    parse WKT (xy), scale to image, apply bbox-relative padding, crop pre and post.
+
+    Saves per building uid:
+      pre_bbox.png  / post_bbox.png  : padded crop with polygon outline drawn in red
+      pre_masked.png/ post_masked.png: same padded region, non-building pixels blacked out
+
+    pad_fraction: padding added on each side relative to building size.
+        pad_px = max(pad_fraction * max(bbox_w, bbox_h), 8)
+        e.g. 0.25 → 25% of the larger bbox dimension on every side.
+
+    Returns number of buildings written.
     """
     out_base = Path(out_dir) / tile_id
     label_data = load_label_json(label_json_path)
@@ -74,7 +107,7 @@ def make_oracle_crops_for_tile(
         if poly is None or bbox is None:
             continue
         x1, y1, x2, y2 = bbox
-        # Clamp to image
+        # Clamp tight bbox to image bounds
         x1 = max(0, min(x1, img_w - 1))
         y1 = max(0, min(y1, img_h - 1))
         x2 = max(x1 + 1, min(x2, img_w))
@@ -82,27 +115,38 @@ def make_oracle_crops_for_tile(
         if x2 <= x1 or y2 <= y1:
             continue
 
+        # --- bbox-relative padding ---
+        bbox_w, bbox_h = x2 - x1, y2 - y1
+        pad = max(int(pad_fraction * max(bbox_w, bbox_h)), 8)
+        px1 = max(0, x1 - pad)
+        py1 = max(0, y1 - pad)
+        px2 = min(img_w, x2 + pad)
+        py2 = min(img_h, y2 + pad)
+
         uid_dir = out_base / uid
         uid_dir.mkdir(parents=True, exist_ok=True)
 
-        if pre_img is not None:
-            crop = pre_img[y1:y2, x1:x2]
-            Image.fromarray(crop).save(uid_dir / "pre_bbox.png")
-        if post_img is not None:
-            crop = post_img[y1:y2, x1:x2]
-            Image.fromarray(crop).save(uid_dir / "post_bbox.png")
+        # Rasterize mask at full image resolution, then slice to padded region
+        mask = rasterize_polygon(poly, (img_h, img_w))
+        mask_roi = mask[py1:py2, px1:px2]           # (crop_h, crop_w)
+        mask_3ch = np.stack([mask_roi] * 3, axis=2) # broadcast for RGB multiply
 
-        if save_masked:
-            mask = rasterize_polygon(poly, (img_h, img_w))
-            mask_roi = mask[y1:y2, x1:x2]
-            if pre_img is not None:
-                pre_roi = pre_img[y1:y2, x1:x2].copy()
-                rgba = np.dstack([pre_roi, (mask_roi * 255)])
-                Image.fromarray(rgba.astype(np.uint8)).save(uid_dir / "pre_masked.png")
-            if post_img is not None:
-                post_roi = post_img[y1:y2, x1:x2].copy()
-                rgba = np.dstack([post_roi, (mask_roi * 255)])
-                Image.fromarray(rgba.astype(np.uint8)).save(uid_dir / "post_masked.png")
+        # Polygon translated into padded-crop local coords for outline drawing
+        poly_local = _translate_polygon(poly, -px1, -py1)
+
+        for src_img, prefix in ((pre_img, "pre"), (post_img, "post")):
+            if src_img is None:
+                continue
+            crop = src_img[py1:py2, px1:px2].copy()
+
+            # Context crop: padded + thin red polygon outline
+            outlined = _draw_polygon_outline(crop, poly_local)
+            Image.fromarray(outlined).save(uid_dir / f"{prefix}_bbox.png")
+
+            # Masked crop: non-building pixels blacked out (RGB, not RGBA)
+            masked = np.where(mask_3ch > 0, crop, np.uint8(0)).astype(np.uint8)
+            Image.fromarray(masked).save(uid_dir / f"{prefix}_masked.png")
+
         count += 1
     return count
 
