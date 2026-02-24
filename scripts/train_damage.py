@@ -21,6 +21,8 @@ New flags (all default to off/scratch — existing behavior is fully preserved):
   --two_stage                Stage1=3-class + Stage2=2-class minor/major (Step 5)
   --init_mode                scratch (default) | pretrained (Step 6)
   --pretrained_ckpt_path     encoder checkpoint for pretrained init (Step 6)
+  --cv_folds_path            path to cv_folds JSON (make_cv_folds.py output)
+  --cv_fold                  fold to use as val set (0..k-1); requires cv_folds_path
 
 Usage:
     python scripts/train_damage.py \\
@@ -257,8 +259,26 @@ def run(args: argparse.Namespace) -> None:
     for cls in DAMAGE_CLASSES:
         print(f"  {cls:20s}: {label_dist.get(cls, 0)}")
 
-    train_recs, val_recs = train_val_split(records, val_fraction=args.val_fraction)
-    print(f"\nTrain: {len(train_recs)}  Val: {len(val_recs)}")
+    # -----------------------------------------------------------------------
+    # Train / val split: CV fold or default 80/20
+    # -----------------------------------------------------------------------
+    if args.cv_folds_path and args.cv_fold is not None:
+        with open(args.cv_folds_path) as _f:
+            _fold_data = json.load(_f)
+        _tile_to_fold = _fold_data["tile_to_fold"]
+        _val_fold     = args.cv_fold
+        _val_tiles    = {t for t, fi in _tile_to_fold.items() if fi == _val_fold}
+        train_recs = [r for r in records if r["tile_id"] not in _val_tiles]
+        val_recs   = [r for r in records if r["tile_id"] in _val_tiles]
+        print(f"\nCV fold {_val_fold}/{_fold_data['k']}: "
+              f"train={len(train_recs)}  val={len(val_recs)}")
+        tr_dist = Counter(r["label"] for r in train_recs)
+        va_dist = Counter(r["label"] for r in val_recs)
+        print("  Train:", {cls: tr_dist.get(cls, 0) for cls in DAMAGE_CLASSES})
+        print("  Val:  ", {cls: va_dist.get(cls, 0) for cls in DAMAGE_CLASSES})
+    else:
+        train_recs, val_recs = train_val_split(records, val_fraction=args.val_fraction)
+        print(f"\nTrain: {len(train_recs)}  Val: {len(val_recs)}")
 
     # -----------------------------------------------------------------------
     # Step 5: two-stage label remapping
@@ -739,6 +759,12 @@ def main() -> None:
                    choices=["scratch", "pretrained"])
     p.add_argument("--pretrained_ckpt_path", type=str, default=None,
                    help="Encoder checkpoint path (required if init_mode=pretrained)")
+
+    # CV — fold-based train/val split (overrides default 80/20 when both are given)
+    p.add_argument("--cv_folds_path", type=str, default=None,
+                   help="Path to cv_folds JSON (output of make_cv_folds.py)")
+    p.add_argument("--cv_fold",       type=int, default=None,
+                   help="Which fold to hold out as val (0..k-1)")
 
     run(p.parse_args())
 
