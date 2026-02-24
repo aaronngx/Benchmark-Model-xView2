@@ -23,6 +23,8 @@ New flags (all default to off/scratch — existing behavior is fully preserved):
   --pretrained_ckpt_path     encoder checkpoint for pretrained init (Step 6)
   --cv_folds_path            path to cv_folds JSON (make_cv_folds.py output)
   --cv_fold                  fold to use as val set (0..k-1); requires cv_folds_path
+  --train_disasters          comma-sep disaster IDs for train (e.g. socal-fire)
+  --val_disasters            comma-sep disaster IDs for val (e.g. santa-rosa-wildfire)
 
 Usage:
     python scripts/train_damage.py \\
@@ -260,9 +262,26 @@ def run(args: argparse.Namespace) -> None:
         print(f"  {cls:20s}: {label_dist.get(cls, 0)}")
 
     # -----------------------------------------------------------------------
-    # Train / val split: CV fold or default 80/20
+    # Train / val split: disaster split > CV fold > default 80/20
     # -----------------------------------------------------------------------
-    if args.cv_folds_path and args.cv_fold is not None:
+    def _disaster_id(tile_id: str) -> str:
+        return tile_id.rsplit("_", 1)[0]
+
+    if args.train_disasters and args.val_disasters:
+        _train_dis = set(args.train_disasters.split(","))
+        _val_dis   = set(args.val_disasters.split(","))
+        train_recs = [r for r in records if _disaster_id(r["tile_id"]) in _train_dis]
+        val_recs   = [r for r in records if _disaster_id(r["tile_id"]) in _val_dis]
+        _tr_tiles  = len({r["tile_id"] for r in train_recs})
+        _va_tiles  = len({r["tile_id"] for r in val_recs})
+        print(f"\nDisaster split — train: {sorted(_train_dis)}  val: {sorted(_val_dis)}")
+        print(f"  Train: {len(train_recs)} buildings across {_tr_tiles} tiles")
+        print(f"  Val:   {len(val_recs)} buildings across {_va_tiles} tiles")
+        tr_dist = Counter(r["label"] for r in train_recs)
+        va_dist = Counter(r["label"] for r in val_recs)
+        print("  Train dist:", {cls: tr_dist.get(cls, 0) for cls in DAMAGE_CLASSES})
+        print("  Val   dist:", {cls: va_dist.get(cls, 0) for cls in DAMAGE_CLASSES})
+    elif args.cv_folds_path and args.cv_fold is not None:
         with open(args.cv_folds_path) as _f:
             _fold_data = json.load(_f)
         _tile_to_fold = _fold_data["tile_to_fold"]
@@ -765,6 +784,12 @@ def main() -> None:
                    help="Path to cv_folds JSON (output of make_cv_folds.py)")
     p.add_argument("--cv_fold",       type=int, default=None,
                    help="Which fold to hold out as val (0..k-1)")
+
+    # Disaster split — overrides both CV and default 80/20 when both are given
+    p.add_argument("--train_disasters", type=str, default=None,
+                   help="Comma-separated disaster IDs for train, e.g. socal-fire")
+    p.add_argument("--val_disasters",   type=str, default=None,
+                   help="Comma-separated disaster IDs for val, e.g. santa-rosa-wildfire")
 
     run(p.parse_args())
 

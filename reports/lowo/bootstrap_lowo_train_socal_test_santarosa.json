@@ -1,0 +1,69 @@
+{
+  "run_id": "lowo_train_socal_test_santarosa",
+  "n_boot": 1000,
+  "tile_count": 72,
+  "seed": 123,
+  "skipped": 0,
+  "metrics": {
+    "minor": {
+      "precision": {
+        "median": 0.0123,
+        "ci95": [
+          0.0,
+          0.0469
+        ]
+      },
+      "recall": {
+        "median": 0.05,
+        "ci95": [
+          0.0,
+          0.1053
+        ]
+      },
+      "f1": {
+        "median": 0.0196,
+        "ci95": [
+          0.0,
+          0.0612
+        ]
+      },
+      "fp_per_1k_no": {
+        "median": 16.063,
+        "ci95": [
+          9.765,
+          25.9386
+        ]
+      }
+    },
+    "major": {
+      "precision": {
+        "median": 0.0131,
+        "ci95": [
+          0.0,
+          0.0354
+        ]
+      },
+      "recall": {
+        "median": 0.1,
+        "ci95": [
+          0.0,
+          0.4
+        ]
+      },
+      "f1": {
+        "median": 0.0233,
+        "ci95": [
+          0.0,
+          0.0625
+        ]
+      },
+      "fp_per_1k_no": {
+        "median": 11.9682,
+        "ci95": [
+          8.0084,
+          16.7848
+        ]
+      }
+    }
+  }
+}
