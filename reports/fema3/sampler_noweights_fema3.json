@@ -1,0 +1,48 @@
+{
+  "method": "sampler_noweights",
+  "checkpoint": "models\\sampler_noweights_s1\\best.pt",
+  "checkpoint_epoch": 20,
+  "n_val": 1468,
+  "fema_macro_f1": 0.6433,
+  "fema_per_class": {
+    "intact": {
+      "precision": 0.9605,
+      "recall": 0.911,
+      "f1": 0.9351
+    },
+    "damaged": {
+      "precision": 0.1163,
+      "recall": 0.2083,
+      "f1": 0.1493
+    },
+    "destroyed": {
+      "precision": 0.8087,
+      "recall": 0.8859,
+      "f1": 0.8456
+    }
+  },
+  "confusion_matrix": {
+    "classes": [
+      "intact",
+      "damaged",
+      "destroyed"
+    ],
+    "matrix": [
+      [
+        972,
+        24,
+        71
+      ],
+      [
+        11,
+        5,
+        8
+      ],
+      [
+        29,
+        14,
+        334
+      ]
+    ]
+  }
+}

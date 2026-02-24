@@ -1,0 +1,48 @@
+{
+  "method": "sampler_capped",
+  "checkpoint": "models\\sampler_capped_s1\\best.pt",
+  "checkpoint_epoch": 23,
+  "n_val": 1468,
+  "fema_macro_f1": 0.6054,
+  "fema_per_class": {
+    "intact": {
+      "precision": 0.9541,
+      "recall": 0.8763,
+      "f1": 0.9135
+    },
+    "damaged": {
+      "precision": 0.0563,
+      "recall": 0.1667,
+      "f1": 0.0842
+    },
+    "destroyed": {
+      "precision": 0.7794,
+      "recall": 0.8621,
+      "f1": 0.8186
+    }
+  },
+  "confusion_matrix": {
+    "classes": [
+      "intact",
+      "damaged",
+      "destroyed"
+    ],
+    "matrix": [
+      [
+        935,
+        48,
+        84
+      ],
+      [
+        12,
+        4,
+        8
+      ],
+      [
+        33,
+        19,
+        325
+      ]
+    ]
+  }
+}

@@ -10,10 +10,11 @@ Supports model types:
   centroid_patch— fixed-size patch from polygon centroid (6-ch CNN input)
 
 New flags (all default to off/scratch — existing behavior is fully preserved):
+  --seed                     global RNG seed for reproducibility (default: 42)
   --run_id                   write val_metrics.jsonl to runs/<run_id>/
   --use_sampler              WeightedRandomSampler for train loader (Step 1)
   --log_batch_class_counts   log first 50 train-batch label histograms, epoch 1 (Step 2B)
-  --weight_mode              normalized_invfreq (default) | capped_floored (Step 3)
+  --weight_mode              normalized_invfreq (default) | capped_floored | none (Step 3)
   --w_min / --w_max          clipping bounds for capped_floored (Step 3)
   --use_hard_negative_mining boost no-dmg hard negatives each epoch (Step 4)
   --hnm_mult                 boost multiplier for HNM (Step 4)
@@ -40,12 +41,26 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
+import random
+
 import numpy as np
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def seed_all(seed: int) -> None:
+    """Pin all RNG sources for reproducible runs."""
+    import torch as _torch
+    random.seed(seed)
+    np.random.seed(seed)
+    _torch.manual_seed(seed)
+    if _torch.cuda.is_available():
+        _torch.cuda.manual_seed_all(seed)
+    _torch.backends.cudnn.benchmark     = False
+    _torch.backends.cudnn.deterministic = True
+
 
 def collate(batch):
     import torch
@@ -87,7 +102,9 @@ def _compute_val_metrics(all_preds, all_labels, num_classes=4):
 
 
 def _compute_class_weights(records, num_classes, weight_mode, w_min, w_max):
-    """Normalized inverse-frequency weights, optionally capped/floored."""
+    """Normalized inverse-frequency weights, optionally capped/floored, or all-ones."""
+    if weight_mode == "none":
+        return np.ones(num_classes, dtype=np.float32)
     counts = np.zeros(num_classes, dtype=np.float32)
     for r in records:
         counts[r["label_idx"]] += 1
@@ -214,8 +231,8 @@ def run(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     # Seed for reproducibility (sampler, weight init, augmentation)
-    torch.manual_seed(42)
-    np.random.seed(42)
+    seed_all(args.seed)
+    print(f"Seed: {args.seed}")
 
     # Step 0: run output directory
     run_dir = Path("runs") / args.run_id if args.run_id else None
@@ -412,14 +429,21 @@ def run(args: argparse.Namespace) -> None:
     # -----------------------------------------------------------------------
     # Loss / optimizer / scheduler
     # -----------------------------------------------------------------------
-    weights = weights.to(device)
-    criterion  = torch.nn.CrossEntropyLoss(weight=weights)
+    if args.weight_mode == "none":
+        criterion = torch.nn.CrossEntropyLoss()
+        print("Criterion: unweighted CrossEntropyLoss (weight_mode=none)")
+    else:
+        weights = weights.to(device)
+        criterion = torch.nn.CrossEntropyLoss(weight=weights)
     optimizer  = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler  = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
     if args.two_stage and model2 is not None:
-        s2_weights = s2_weights.to(device)
-        criterion2 = torch.nn.CrossEntropyLoss(weight=s2_weights)
+        if args.weight_mode == "none":
+            criterion2 = torch.nn.CrossEntropyLoss()
+        else:
+            s2_weights = s2_weights.to(device)
+            criterion2 = torch.nn.CrossEntropyLoss(weight=s2_weights)
         optimizer2 = torch.optim.AdamW(model2.parameters(), lr=args.lr, weight_decay=1e-4)
         scheduler2 = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer2, T_max=args.epochs)
 
@@ -677,6 +701,10 @@ def main() -> None:
     p.add_argument("--device",       default=None, help="cuda | cpu | auto")
     p.add_argument("--resume",       action="store_true")
 
+    # Reproducibility
+    p.add_argument("--seed",         type=int, default=42,
+                   help="Global RNG seed (random, numpy, torch, cuda)")
+
     # Step 0 — tracking
     p.add_argument("--run_id",       type=str, default=None,
                    help="Write val_metrics.jsonl to runs/<run_id>/")
@@ -691,7 +719,7 @@ def main() -> None:
 
     # Step 3 — weight mode
     p.add_argument("--weight_mode",  type=str, default="normalized_invfreq",
-                   choices=["normalized_invfreq", "capped_floored"])
+                   choices=["normalized_invfreq", "capped_floored", "none"])
     p.add_argument("--w_min",        type=float, default=0.25,
                    help="Min loss weight for capped_floored")
     p.add_argument("--w_max",        type=float, default=5.0,

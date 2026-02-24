@@ -1,0 +1,4 @@
+method,n_seeds,macro_f1_mean,macro_f1_std,f1_minor_mean,f1_minor_std,f1_major_mean,f1_major_std,fp_per_1000_no_minor_mean,fp_per_1000_no_minor_std,fp_per_1000_no_major_mean,fp_per_1000_no_major_std,pred_minor_mean,pred_minor_std,pred_major_mean,pred_major_std
+baseline,3,0.463,0.0034,0.0677,0.0253,0.0371,0.0394,12.1833,10.8085,21.556,16.2599,14.3333,11.5036,35.3333,25.8908
+sampler_capped,3,0.4669,0.0013,0.071,0.0348,0.0599,0.0272,32.8023,9.5116,22.8053,3.2916,44.0,11.5326,39.0,4.5826
+sampler_noweights,3,0.5147,0.0052,0.1598,0.0758,0.1254,0.0631,14.995,7.3199,11.2463,2.8115,22.6667,10.7858,22.3333,6.4291

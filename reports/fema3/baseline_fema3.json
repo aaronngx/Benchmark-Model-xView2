@@ -1,0 +1,48 @@
+{
+  "method": "baseline",
+  "checkpoint": "models\\baseline_s1\\best.pt",
+  "checkpoint_epoch": 22,
+  "n_val": 1468,
+  "fema_macro_f1": 0.6154,
+  "fema_per_class": {
+    "intact": {
+      "precision": 0.9504,
+      "recall": 0.88,
+      "f1": 0.9139
+    },
+    "damaged": {
+      "precision": 0.0704,
+      "recall": 0.2083,
+      "f1": 0.1053
+    },
+    "destroyed": {
+      "precision": 0.7946,
+      "recall": 0.8621,
+      "f1": 0.827
+    }
+  },
+  "confusion_matrix": {
+    "classes": [
+      "intact",
+      "damaged",
+      "destroyed"
+    ],
+    "matrix": [
+      [
+        939,
+        52,
+        76
+      ],
+      [
+        11,
+        5,
+        8
+      ],
+      [
+        38,
+        14,
+        325
+      ]
+    ]
+  }
+}
