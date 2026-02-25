@@ -141,7 +141,7 @@ def _base_sample_weights(records, class_weights_np):
 
 
 def _build_sampler(sample_weights_np, num_samples):
-    """Build WeightedRandomSampler with replacement."""
+    """Build WeightedRandomSampler with replacement (invfreq mode)."""
     import torch
     from torch.utils.data import WeightedRandomSampler
     return WeightedRandomSampler(
@@ -149,6 +149,70 @@ def _build_sampler(sample_weights_np, num_samples):
         num_samples=num_samples,
         replacement=True,
     )
+
+
+def _build_sampler_capped(records, base_w_np, cap: float):
+    """
+    invfreq_capped: same as invfreq but per-sample weight multiplier is capped at `cap`.
+    Reduces extreme repetition of the rarest minority items.
+    """
+    import torch
+    from torch.utils.data import WeightedRandomSampler
+    raw_w = np.array([float(base_w_np[r["label_idx"]]) for r in records], dtype=np.float32)
+    # Compute per-sample multiplier relative to no-damage weight (class 0)
+    w_no = base_w_np[0] if base_w_np[0] > 0 else 1.0
+    capped = np.minimum(raw_w / w_no, cap) * w_no
+    return WeightedRandomSampler(
+        weights=torch.from_numpy(capped).float(),
+        num_samples=len(records),
+        replacement=True,
+    )
+
+
+class _ClassQuotaBatchSampler:
+    """
+    Ensures each batch contains at least 1 minor (class 1) and 1 major (class 2)
+    sample if available in the training set.  Remaining slots filled by invfreq
+    WeightedRandomSampler.  Uses replacement within the quota slots.
+    """
+    def __init__(self, records: list[dict], batch_size: int, base_w_np: np.ndarray) -> None:
+        self.batch_size = batch_size
+        # Index by class
+        self.by_class: dict[int, list[int]] = {}
+        for i, r in enumerate(records):
+            c = r["label_idx"]
+            self.by_class.setdefault(c, []).append(i)
+        # Invfreq weights for filling remaining slots
+        import torch
+        from torch.utils.data import WeightedRandomSampler
+        sw = np.array([float(base_w_np[r["label_idx"]]) for r in records], dtype=np.float32)
+        self._sampler = WeightedRandomSampler(
+            torch.from_numpy(sw).float(), num_samples=len(records), replacement=True
+        )
+        self._n_batches = len(records) // batch_size
+
+    def __iter__(self):
+        import random as _rnd
+        fill_indices = list(self._sampler)
+        fill_pos = 0
+        for _ in range(self._n_batches):
+            batch = []
+            # Quota: 1 minor + 1 major (if class exists)
+            for cls in (1, 2):
+                if self.by_class.get(cls):
+                    batch.append(_rnd.choice(self.by_class[cls]))
+            # Fill remaining slots
+            while len(batch) < self.batch_size:
+                if fill_pos >= len(fill_indices):
+                    fill_indices = list(self._sampler)
+                    fill_pos = 0
+                batch.append(fill_indices[fill_pos])
+                fill_pos += 1
+            _rnd.shuffle(batch)
+            yield batch
+
+    def __len__(self):
+        return self._n_batches
 
 
 def _load_encoder_weights(model, ckpt_path: str, device):
@@ -211,6 +275,389 @@ def _two_stage_predict(x_batch, model1, model2, device):
 
 
 # ---------------------------------------------------------------------------
+# Prediction policy and threshold helpers
+# ---------------------------------------------------------------------------
+
+def predict_with_policy(
+    probs: np.ndarray,
+    policy: str,
+    thresholds: "dict | None",
+) -> np.ndarray:
+    """
+    Apply prediction policy to a (N, C) probability array.
+
+    policy: "argmax" | "per_class_threshold" | "ordinal_threshold"
+    thresholds: dict with optional keys:
+      per_class_threshold: "minor" (float), "major" (float)
+      ordinal_threshold:   "tau_damage" (float), "tau_severe" (float)
+
+    per_class_threshold rule:
+      - If p(minor) >= tau_minor  -> minor_candidate
+      - If p(major) >= tau_major  -> major_candidate
+      - Both candidates: choose the one with larger (p - tau) margin
+      - One candidate: choose it.
+      - No candidates: fallback to argmax over all 4 classes.
+
+    ordinal_threshold rule (cumulative probabilities):
+      p_damage = p(minor) + p(major) + p(destroyed)  [= 1 - p(no_damage)]
+      p_severe = p(major) + p(destroyed)
+      - If p_severe >= tau_severe:
+            predict argmax over {major(2), destroyed(3)}
+      - Elif p_damage >= tau_damage:
+            predict argmax over {minor(1), major(2), destroyed(3)}
+      - Else:
+            predict no-damage (0)
+
+    Returns (N,) int ndarray.
+    """
+    preds = probs.argmax(axis=1).copy()
+    if policy == "argmax" or thresholds is None:
+        return preds
+
+    if policy == "ordinal_threshold":
+        tau_damage = float(thresholds.get("tau_damage", 0.5))
+        tau_severe = float(thresholds.get("tau_severe", 0.5))
+        p_damage = probs[:, 1] + probs[:, 2] + probs[:, 3]   # 1 - p(no_damage)
+        p_severe = probs[:, 2] + probs[:, 3]
+        for i in range(len(probs)):
+            if p_severe[i] >= tau_severe:
+                # choose between major(2) and destroyed(3)
+                preds[i] = 2 if probs[i, 2] >= probs[i, 3] else 3
+            elif p_damage[i] >= tau_damage:
+                # choose among minor(1), major(2), destroyed(3)
+                preds[i] = int(np.argmax(probs[i, 1:]) + 1)
+            else:
+                preds[i] = 0
+        return preds
+
+    # per_class_threshold
+    tau_minor = thresholds.get("minor")
+    tau_major  = thresholds.get("major")
+    if tau_minor is None:
+        tau_minor = 0.5
+    if tau_major is None:
+        tau_major = 0.5
+
+    for i in range(len(probs)):
+        minor_cand = bool(probs[i, 1] >= tau_minor)
+        major_cand = bool(probs[i, 2] >= tau_major)
+        if minor_cand and major_cand:
+            # Tie-break: larger (prob - threshold) margin wins
+            minor_margin = probs[i, 1] - tau_minor
+            major_margin = probs[i, 2] - tau_major
+            preds[i] = 1 if minor_margin >= major_margin else 2
+        elif minor_cand:
+            preds[i] = 1
+        elif major_cand:
+            preds[i] = 2
+        # else: keep argmax fallback
+    return preds
+
+
+def _fit_thresholds(
+    all_probs: np.ndarray,
+    all_labels: np.ndarray,
+    target_recall_minor: float,
+    target_recall_major: float,
+    never_miss: bool,
+) -> "tuple[dict, dict]":
+    """
+    Deterministic per-class threshold fitting (replaces coarse grid search).
+
+    For each class c in {minor(1), major(2)}:
+      S_pos = probs[pos_mask, c]
+      If n_pos == 0:
+        tau = 0.0 (never_miss=True) or 0.5 (never_miss=False)
+      elif target_recall >= 1.0:
+        tau = max(0.0, min(S_pos) - eps)   <- guarantees every calib positive
+      else:
+        tau = quantile(S_pos, 1 - target_recall) - eps   <- largest tau meeting target
+
+    Returns (thresholds: dict, calib_summary: dict).
+    """
+    eps = 1e-6
+    thresholds: dict = {}
+    calib_summary: dict = {}
+
+    for cls_idx, name, target_recall in [
+        (1, "minor", target_recall_minor),
+        (2, "major", target_recall_major),
+    ]:
+        pos_mask  = (all_labels == cls_idx)
+        n_pos     = int(pos_mask.sum())
+        probs_cls = all_probs[:, cls_idx]
+
+        if n_pos == 0:
+            tau = 0.0 if never_miss else 0.5
+            label = "0.0 (never_miss: aggressive flagging)" if never_miss else "0.5 (default)"
+            print(f"  [{name}] WARNING: no positives in calib — cannot fit tau; "
+                  f"using {label}")
+            thresholds[name] = float(tau)
+            calib_summary[name] = {
+                "n_pos": 0, "tau": float(tau),
+                "achieved_recall": None, "fp_calib": None,
+                "fp_per_1k_no_calib": None,
+            }
+            continue
+
+        S_pos = probs_cls[pos_mask]
+
+        if target_recall >= 1.0:
+            tau = max(0.0, float(S_pos.min()) - eps)
+        else:
+            tau = float(np.quantile(S_pos, 1.0 - target_recall)) - eps
+            tau = max(0.0, tau)
+
+        achieved_recall = float((probs_cls[pos_mask] >= tau).sum()) / n_pos
+        fp           = int((probs_cls[~pos_mask] >= tau).sum())
+        n_no         = int((all_labels == 0).sum())
+        fp_per_1k_no = 1000.0 * int((probs_cls[all_labels == 0] >= tau).sum()) / max(n_no, 1)
+
+        print(f"  [{name}] target_recall={target_recall:.2f}  "
+              f"tau={tau:.6f}  achieved_recall={achieved_recall:.4f}  "
+              f"FP_calib={fp}  FP/1k-no={fp_per_1k_no:.1f}")
+
+        thresholds[name]    = float(tau)
+        calib_summary[name] = {
+            "n_pos":              n_pos,
+            "tau":                round(float(tau), 8),
+            "achieved_recall":    round(achieved_recall, 4),
+            "fp_calib":           fp,
+            "fp_per_1k_no_calib": round(fp_per_1k_no, 2),
+        }
+
+    return thresholds, calib_summary
+
+
+def _fit_thresholds_ordinal(
+    all_probs: np.ndarray,
+    all_labels: np.ndarray,
+    target_recall_damage: float,
+    target_recall_severe: float,
+    never_miss: bool,
+) -> "tuple[dict, dict]":
+    """
+    Fit cumulative (ordinal) thresholds for two detection tasks:
+      - damage detection: minor-or-worse (label in {1,2,3})
+      - severe detection: major-or-worse (label in {2,3})
+
+    Scores used:
+      S_damage = p(minor) + p(major) + p(destroyed)   [= 1 - p(no_damage)]
+      S_severe = p(major) + p(destroyed)
+
+    For target_recall >= 1.0:
+      tau = max(0.0, min(S_pos) - eps)   <- guarantees every calib positive
+    Else:
+      tau = quantile(S_pos, 1 - target_recall) - eps
+
+    Returns (thresholds: dict, calib_summary: dict).
+    """
+    eps = 1e-6
+    thresholds: dict = {}
+    calib_summary: dict = {}
+
+    p_damage = all_probs[:, 1] + all_probs[:, 2] + all_probs[:, 3]
+    p_severe = all_probs[:, 2] + all_probs[:, 3]
+
+    tasks = [
+        ("tau_damage", p_damage, np.isin(all_labels, [1, 2, 3]), target_recall_damage,
+         "damage (minor-or-worse)"),
+        ("tau_severe", p_severe, np.isin(all_labels, [2, 3]),    target_recall_severe,
+         "severe (major-or-worse)"),
+    ]
+
+    for key, scores, pos_mask, target_recall, desc in tasks:
+        n_pos = int(pos_mask.sum())
+
+        if n_pos == 0:
+            tau = 0.0 if never_miss else 0.5
+            label = "0.0 (never_miss)" if never_miss else "0.5 (default)"
+            print(f"  [{key}] WARNING: no positives in calib — cannot fit; using {label}")
+            thresholds[key] = float(tau)
+            calib_summary[key] = {
+                "n_pos": 0, "tau": float(tau),
+                "achieved_recall": None, "fp_per_1k_no_calib": None,
+            }
+            continue
+
+        S_pos = scores[pos_mask]
+
+        if target_recall >= 1.0:
+            tau = max(0.0, float(S_pos.min()) - eps)
+        else:
+            tau = float(np.quantile(S_pos, 1.0 - target_recall)) - eps
+            tau = max(0.0, tau)
+
+        achieved_recall = float((scores[pos_mask] >= tau).sum()) / n_pos
+        n_no   = int((all_labels == 0).sum())
+        fp_per_1k_no = 1000.0 * int((scores[all_labels == 0] >= tau).sum()) / max(n_no, 1)
+
+        print(f"  [{key}] {desc}  target_recall={target_recall:.2f}  "
+              f"tau={tau:.6f}  achieved_recall={achieved_recall:.4f}  "
+              f"FP/1k-no={fp_per_1k_no:.1f}")
+
+        thresholds[key] = round(float(tau), 8)
+        calib_summary[key] = {
+            "n_pos":              n_pos,
+            "tau":                round(float(tau), 8),
+            "achieved_recall":    round(achieved_recall, 4),
+            "fp_per_1k_no_calib": round(fp_per_1k_no, 2),
+        }
+
+    return thresholds, calib_summary
+
+
+def _make_eval_metrics(
+    all_preds: "list | np.ndarray",
+    all_labels: "list | np.ndarray",
+    policy: str,
+    thresholds: "dict | None",
+) -> dict:
+    """
+    Full evaluation metrics dict — includes explicit FN counts for minor/major.
+
+    Keys: policy, macro_f1, per_class, n_minor_test, FN_minor_test,
+          recall_minor_test, n_major_test, FN_major_test, recall_major_test,
+          FP_per_1000_no_minor, FP_per_1000_no_major, confusion_matrix,
+          thresholds_used.
+    """
+    _CLS = ["no-damage", "minor-damage", "major-damage", "destroyed"]
+    preds  = np.asarray(all_preds)
+    labels = np.asarray(all_labels)
+
+    f1s, macro_f1, precs, recs = _compute_val_metrics(
+        preds.tolist(), labels.tolist(), num_classes=4
+    )
+    cm = _compute_confusion_matrix(preds.tolist(), labels.tolist(), num_classes=4)
+
+    NO, MINOR, MAJOR = 0, 1, 2
+    n_no    = int((labels == NO).sum())
+    n_minor = int((labels == MINOR).sum())
+    n_major = int((labels == MAJOR).sum())
+    FN_minor = int(((labels == MINOR) & (preds != MINOR)).sum())
+    FN_major = int(((labels == MAJOR) & (preds != MAJOR)).sum())
+    recall_minor = round((n_minor - FN_minor) / n_minor, 4) if n_minor > 0 else None
+    recall_major = round((n_major - FN_major) / n_major, 4) if n_major > 0 else None
+    fp_minor_from_no = int(cm[NO][MINOR])
+    fp_major_from_no = int(cm[NO][MAJOR])
+
+    return {
+        "policy":               policy,
+        "macro_f1":             round(macro_f1, 4),
+        "per_class":            {
+            _CLS[i]: {
+                "f1":   round(f1s[i], 4),
+                "prec": round(precs[i], 4),
+                "rec":  round(recs[i], 4),
+            } for i in range(4)
+        },
+        "n_minor_test":         n_minor,
+        "FN_minor_test":        FN_minor,
+        "recall_minor_test":    recall_minor,
+        "n_major_test":         n_major,
+        "FN_major_test":        FN_major,
+        "recall_major_test":    recall_major,
+        "FP_per_1000_no_minor": round(1000.0 * fp_minor_from_no / max(n_no, 1), 2),
+        "FP_per_1000_no_major": round(1000.0 * fp_major_from_no / max(n_no, 1), 2),
+        "confusion_matrix":     cm.tolist(),
+        "thresholds_used":      thresholds,
+    }
+
+
+def _make_eval_metrics_ordinal(
+    all_preds: "list | np.ndarray",
+    all_labels: "list | np.ndarray",
+    all_probs: "np.ndarray | None",
+    policy: str,
+    thresholds: "dict | None",
+) -> dict:
+    """
+    Evaluation metrics including explicit damage/severe detection tasks.
+
+    damage detection: minor-or-worse (label in {1,2,3}) as positive
+    severe detection:  major-or-worse (label in {2,3}) as positive
+
+    FP_damage_per_1000_no: FP from no-damage buildings classified as any damage
+    FP_severe_per_1000_nonsevere: FP from non-severe classified as severe
+    """
+    base = _make_eval_metrics(all_preds, all_labels, policy, thresholds)
+
+    preds  = np.asarray(all_preds)
+    labels = np.asarray(all_labels)
+
+    # Damage detection task (minor-or-worse)
+    pos_damage  = np.isin(labels, [1, 2, 3])
+    pred_damage = np.isin(preds,  [1, 2, 3])
+    n_pos_damage  = int(pos_damage.sum())
+    n_no          = int((labels == 0).sum())
+    FN_damage     = int((pos_damage & ~pred_damage).sum())
+    FP_damage     = int((~pos_damage & pred_damage).sum())
+    recall_damage = round((n_pos_damage - FN_damage) / n_pos_damage, 4) if n_pos_damage > 0 else None
+    fp_damage_per_1k_no = round(1000.0 * int(((labels == 0) & pred_damage).sum()) / max(n_no, 1), 2)
+
+    # Severe detection task (major-or-worse)
+    pos_severe      = np.isin(labels, [2, 3])
+    pred_severe     = np.isin(preds,  [2, 3])
+    n_pos_severe    = int(pos_severe.sum())
+    n_nonsevere     = int((~pos_severe).sum())
+    FN_severe       = int((pos_severe & ~pred_severe).sum())
+    FP_severe       = int((~pos_severe & pred_severe).sum())
+    recall_severe   = round((n_pos_severe - FN_severe) / n_pos_severe, 4) if n_pos_severe > 0 else None
+    fp_severe_per_1k_nonsevere = round(1000.0 * FP_severe / max(n_nonsevere, 1), 2)
+
+    base.update({
+        "n_pos_damage":              n_pos_damage,
+        "FN_damage":                 FN_damage,
+        "recall_damage":             recall_damage,
+        "FP_damage_per_1000_no":     fp_damage_per_1k_no,
+        "n_pos_severe":              n_pos_severe,
+        "FN_severe":                 FN_severe,
+        "recall_severe":             recall_severe,
+        "FP_severe_per_1000_nonsevere": fp_severe_per_1k_nonsevere,
+    })
+    return base
+
+
+def _tile_grouped_calib_split(
+    records: list,
+    calib_fraction: float,
+    seed: int,
+) -> "tuple[list, list]":
+    """
+    Tile-grouped split of records into (train_fit, calib).
+
+    Tries to include some minority (minor/major) tiles in calib for threshold
+    fitting.  Logs a warning if none are available.
+
+    Returns (train_fit_recs, calib_recs).  No tile appears in both sets.
+    """
+    import random as _rnd_inner
+    rng = _rnd_inner.Random(seed)
+
+    tile_ids      = sorted({r["tile_id"] for r in records})
+    minority_set  = {r["tile_id"] for r in records if r["label_idx"] in (1, 2)}
+    minority_list = sorted(minority_set)
+    majority_list = [t for t in tile_ids if t not in minority_set]
+
+    n_calib_total = max(1, int(len(tile_ids) * calib_fraction))
+    n_min_calib   = max(0, int(len(minority_list) * calib_fraction))
+    n_maj_calib   = max(0, n_calib_total - n_min_calib)
+
+    rng.shuffle(minority_list)
+    rng.shuffle(majority_list)
+
+    calib_tiles = set(minority_list[:n_min_calib] + majority_list[:n_maj_calib])
+
+    if not (calib_tiles & minority_set):
+        print("  [NestedCV] WARNING: calib set has no minor/major tiles — "
+              "threshold fitting will use fallback values.")
+
+    train_fit = [r for r in records if r["tile_id"] not in calib_tiles]
+    calib     = [r for r in records if r["tile_id"] in calib_tiles]
+    return train_fit, calib
+
+
+# ---------------------------------------------------------------------------
 # Main training function
 # ---------------------------------------------------------------------------
 
@@ -227,6 +674,20 @@ def run(args: argparse.Namespace) -> None:
         NineChannelDataset,
     )
     from disaster_bench.models.damage.classifiers import build_classifier, save_checkpoint
+
+    # ---------------------------------------------------------------------------
+    # Never-miss mode: force target_recall=1.0 and threshold_policy
+    # ---------------------------------------------------------------------------
+    if getattr(args, "never_miss_mode", 0):
+        args.target_recall_minor = 1.0
+        args.target_recall_major = 1.0
+        # Use ordinal_threshold when policy is already set to ordinal, or
+        # when the user has not overridden it away from argmax default.
+        if getattr(args, "threshold_policy", "argmax") in ("argmax", "per_class_threshold"):
+            args.threshold_policy = "ordinal_threshold"
+        print("[NeverMiss] FN=0 mode active: "
+              "target_recall=1.0, "
+              f"threshold_policy={args.threshold_policy}")
 
     # Validate pretrained args
     if args.init_mode == "pretrained" and not args.pretrained_ckpt_path:
@@ -300,6 +761,26 @@ def run(args: argparse.Namespace) -> None:
         print(f"\nTrain: {len(train_recs)}  Val: {len(val_recs)}")
 
     # -----------------------------------------------------------------------
+    # Nested CV: further split outer-train tiles into train_fit + calib
+    # outer_test_recs stays completely hidden until post-training evaluation.
+    # -----------------------------------------------------------------------
+    outer_test_recs = None
+    if getattr(args, "nested_cv", 0) and args.cv_folds_path and args.cv_fold is not None:
+        outer_test_recs = val_recs          # hold out; never used during training
+        _calib_seed = getattr(args, "calib_seed", None) or args.seed
+        train_recs, val_recs = _tile_grouped_calib_split(
+            train_recs,
+            calib_fraction=getattr(args, "calib_fraction", 0.2),
+            seed=_calib_seed,
+        )
+        from collections import Counter as _Ctr
+        _ncv_dist = _Ctr(r["label"] for r in val_recs)
+        print(f"\n[NestedCV fold={args.cv_fold}] "
+              f"train_fit={len(train_recs)}  calib={len(val_recs)}  "
+              f"outer_test={len(outer_test_recs)}")
+        print(f"  Calib dist: { {cls: _ncv_dist.get(cls, 0) for cls in DAMAGE_CLASSES} }")
+
+    # -----------------------------------------------------------------------
     # Step 5: two-stage label remapping
     # -----------------------------------------------------------------------
     S1_REMAP  = {0: 0, 1: 1, 2: 1, 3: 2}   # no-dmg=0, damaged(minor+major)=1, dest=2
@@ -352,11 +833,20 @@ def run(args: argparse.Namespace) -> None:
         train_ds_base = None
 
     else:
+        aug_config = {
+            "rotate90":     args.aug_rotate90,
+            "affine":       args.aug_affine,
+            "color_jitter": args.aug_color_jitter,
+            "noise":        args.aug_noise,
+        }
         if args.two_stage:
-            train_ds_base    = CropDataset(s1_train_recs, size=args.size, augment=True,  preload=True)
-            s2_train_ds_base = CropDataset(s2_train_recs, size=args.size, augment=True,  preload=True)
+            train_ds_base    = CropDataset(s1_train_recs, size=args.size, augment=True,
+                                           preload=True, aug_config=aug_config)
+            s2_train_ds_base = CropDataset(s2_train_recs, size=args.size, augment=True,
+                                           preload=True, aug_config=aug_config)
         else:
-            train_ds_base    = CropDataset(train_recs, size=args.size, augment=True,  preload=True)
+            train_ds_base    = CropDataset(train_recs, size=args.size, augment=True,
+                                           preload=True, aug_config=aug_config)
             s2_train_ds_base = None
         val_ds_base = CropDataset(val_recs, size=args.size, augment=False, preload=True)
 
@@ -368,6 +858,20 @@ def run(args: argparse.Namespace) -> None:
             train_ds    = train_ds_base
             s2_train_ds = s2_train_ds_base
             val_ds      = val_ds_base
+
+    # Outer test dataset (nested CV only — never used during the training loop)
+    outer_test_ds     = None
+    outer_test_loader = None
+    if outer_test_recs is not None:
+        if args.model_type == "centroid_patch":
+            outer_test_ds = CentroidDataset(outer_test_recs, size=args.size, augment=False)
+        else:
+            _ot_base = CropDataset(outer_test_recs, size=args.size, augment=False, preload=True)
+            outer_test_ds = (NineChannelDataset(_ot_base)
+                             if args.model_type == "pre_post_diff" else _ot_base)
+        outer_test_loader = DataLoader(outer_test_ds, batch_size=args.batch, shuffle=False,
+                                       collate_fn=collate, num_workers=0)
+        print(f"[NestedCV] outer_test preloaded: {len(outer_test_recs)} buildings")
 
     # -----------------------------------------------------------------------
     # Step 3: loss weights
@@ -389,7 +893,7 @@ def run(args: argparse.Namespace) -> None:
         s1_base_w_np = _compute_class_weights(s1_train_recs, 3,
                                                "normalized_invfreq", 0.0, 1e9)
     else:
-        # 4-class weights (existing behavior)
+        # 4-class weights (existing behavior when --loss ce)
         raw_w_np = _compute_class_weights(train_recs, 4,
                                            args.weight_mode, args.w_min, args.w_max)
         weights  = torch.from_numpy(raw_w_np).float()
@@ -397,6 +901,37 @@ def run(args: argparse.Namespace) -> None:
               f"{ {c: round(float(w), 4) for c, w in zip(DAMAGE_CLASSES, weights)} }")
         # Base (unclipped) weights for sampler
         base_w_np = _compute_class_weights(train_recs, 4, "normalized_invfreq", 0.0, 1e9)
+
+    # -----------------------------------------------------------------------
+    # New long-tail losses (cb_ce / focal / ldam_drw)
+    # Computed here after train_recs is established (not inside two_stage branch)
+    # -----------------------------------------------------------------------
+    _loss_counts_np = None   # will be set below if needed
+    _loss_info      = {}
+    if not args.two_stage and args.loss != "ce":
+        from disaster_bench.training.losses import build_criterion as _build_criterion
+        _new_criterion, _loss_info = _build_criterion(
+            loss_type        = args.loss,
+            train_records    = train_recs,
+            beta             = args.beta,
+            gamma            = args.gamma,
+            max_m            = args.max_m,
+            s                = args.ldam_s,
+            drw_start_epoch  = args.drw_start_epoch,
+        )
+        from disaster_bench.training.losses import compute_class_counts as _cc
+        _loss_counts_np = _cc(train_recs)
+        print(f"Loss: {args.loss}  info={_loss_info}")
+
+    # -----------------------------------------------------------------------
+    # Logit adjustment prior (computed from raw train labels, not sampler dist)
+    # -----------------------------------------------------------------------
+    _log_prior = None
+    if args.logit_adjust != "none" and not args.two_stage:
+        from disaster_bench.training.losses import make_log_prior as _mlp
+        _log_prior = _mlp(train_recs, num_classes=4)
+        print(f"Logit adjustment: tau={args.logit_adjust_tau}  "
+              f"prior={[round(float(p), 4) for p in _log_prior.exp().tolist()]}")
 
     # -----------------------------------------------------------------------
     # Step 1: DataLoaders (optional WeightedRandomSampler)
@@ -410,12 +945,27 @@ def run(args: argparse.Namespace) -> None:
         print("[HNM] use_sampler=0 but use_hard_negative_mining=1; "
               "switching to sampler automatically.")
 
+    _sampler_mode = args.sampler_mode if need_sampler else None
     if need_sampler:
         base_w = s1_base_w_np if args.two_stage else base_w_np
         sample_weights_np = _base_sample_weights(train_records_list, base_w)
-        sampler = _build_sampler(sample_weights_np, len(train_records_list))
-        train_loader = DataLoader(train_ds, batch_size=args.batch, sampler=sampler,
-                                  collate_fn=collate, num_workers=0)
+
+        if _sampler_mode == "invfreq_capped":
+            sampler = _build_sampler_capped(train_records_list, base_w, args.sampler_cap)
+            train_loader = DataLoader(train_ds, batch_size=args.batch, sampler=sampler,
+                                      collate_fn=collate, num_workers=0)
+            print(f"Sampler: invfreq_capped (cap={args.sampler_cap})")
+        elif _sampler_mode == "class_quota_batch":
+            batch_sampler = _ClassQuotaBatchSampler(train_records_list, args.batch, base_w)
+            train_loader = DataLoader(train_ds, batch_sampler=batch_sampler,
+                                      collate_fn=collate, num_workers=0)
+            print("Sampler: class_quota_batch (>=1 minor, >=1 major per batch)")
+        else:
+            # invfreq (default)
+            sampler = _build_sampler(sample_weights_np, len(train_records_list))
+            train_loader = DataLoader(train_ds, batch_size=args.batch, sampler=sampler,
+                                      collate_fn=collate, num_workers=0)
+            print("Sampler: invfreq (WeightedRandomSampler)")
     else:
         train_loader = DataLoader(train_ds, batch_size=args.batch, shuffle=True,
                                   collate_fn=collate, num_workers=0)
@@ -468,7 +1018,13 @@ def run(args: argparse.Namespace) -> None:
     # -----------------------------------------------------------------------
     # Loss / optimizer / scheduler
     # -----------------------------------------------------------------------
-    if args.weight_mode == "none":
+    if not args.two_stage and args.loss != "ce":
+        # New long-tail loss (cb_ce / focal / ldam_drw)
+        criterion = _new_criterion
+        # Move any buffers to device
+        criterion = criterion.to(device) if hasattr(criterion, 'to') else criterion
+        print(f"Criterion: {args.loss}")
+    elif args.weight_mode == "none":
         criterion = torch.nn.CrossEntropyLoss()
         print("Criterion: unweighted CrossEntropyLoss (weight_mode=none)")
     else:
@@ -514,9 +1070,35 @@ def run(args: argparse.Namespace) -> None:
     f1s, macro_f1 = [0.0] * 4, 0.0
 
     # -----------------------------------------------------------------------
-    # Training loop
+    # eval_only: skip training, load existing best checkpoint, go straight
+    # to threshold fitting + outer-test evaluation (crossfit_pool pooling).
     # -----------------------------------------------------------------------
-    for epoch in range(start_epoch, args.epochs + 1):
+    _eval_only = bool(getattr(args, "eval_only", False))
+    if _eval_only:
+        if not best_path.exists():
+            print(f"[eval_only] ERROR: no checkpoint at {best_path}. "
+                  "Run training first.", file=sys.stderr)
+            sys.exit(1)
+        print(f"[eval_only] Skipping training — loading {best_path}")
+        ckpt_r = torch.load(str(best_path), map_location=device, weights_only=False)
+        model.load_state_dict(ckpt_r["model_state_dict"])
+        best_val_f1 = ckpt_r.get("val_macro_f1", 0.0)
+        print(f"[eval_only] Checkpoint loaded (best_val_f1={best_val_f1:.4f})")
+
+    # -----------------------------------------------------------------------
+    # Training loop  (skipped entirely when --eval_only 1)
+    # -----------------------------------------------------------------------
+    _train_start = 0 if _eval_only else start_epoch
+    _train_end   = 0 if _eval_only else args.epochs + 1
+    for epoch in range(_train_start, _train_end):
+
+        # --- DRW: switch to class-balanced weights at drw_start_epoch ---
+        if (not args.two_stage and args.loss == "ldam_drw"
+                and epoch == args.drw_start_epoch
+                and _loss_counts_np is not None):
+            from disaster_bench.training.losses import apply_drw_weights as _adw
+            _adw(criterion, _loss_counts_np, beta=args.beta, device=device)
+            print(f"  [DRW] Switched to class-balanced weights at epoch {epoch}")
 
         # --- Stage 1 train ---
         model.train()
@@ -574,7 +1156,13 @@ def run(args: argparse.Namespace) -> None:
                 if args.two_stage and model2 is not None:
                     all_preds.extend(_two_stage_predict(x, model, model2, device))
                 else:
-                    all_preds.extend(model(x).argmax(1).cpu().tolist())
+                    logits = model(x)
+                    if _log_prior is not None:
+                        from disaster_bench.training.losses import logit_adjust as _la
+                        logits = _la(logits, _log_prior, tau=args.logit_adjust_tau)
+                        if args.logit_adjust_train and model.training:
+                            pass  # already applied above
+                    all_preds.extend(logits.argmax(1).cpu().tolist())
                 all_labels.extend(y.tolist())
 
         f1s, macro_f1, precs, recs_pc = _compute_val_metrics(all_preds, all_labels, num_classes=4)
@@ -694,28 +1282,289 @@ def run(args: argparse.Namespace) -> None:
                                       collate_fn=collate, num_workers=0)
 
     # -----------------------------------------------------------------------
-    # Save final checkpoints
+    # Save final checkpoints  (skipped in eval_only mode)
     # -----------------------------------------------------------------------
-    save_checkpoint(
-        model, str(last_path),
-        model_type=args.model_type,
-        epoch=args.epochs,
-        val_macro_f1=macro_f1,
-        per_class_f1={DAMAGE_CLASSES[i]: round(f1s[i], 4) for i in range(4)},
-        input_size=args.size,
-        num_classes=num_classes_s1,
-    )
-    if args.two_stage and model2 is not None:
+    if not _eval_only:
         save_checkpoint(
-            model2, str(last2_path),
+            model, str(last_path),
             model_type=args.model_type,
             epoch=args.epochs,
             val_macro_f1=macro_f1,
-            per_class_f1={},
+            per_class_f1={DAMAGE_CLASSES[i]: round(f1s[i], 4) for i in range(4)},
             input_size=args.size,
-            num_classes=num_classes_s2,
+            num_classes=num_classes_s1,
         )
-    print(f"\nDone. Best val macro_f1={best_val_f1:.4f}  -> {out_dir}/best.pt")
+        if args.two_stage and model2 is not None:
+            save_checkpoint(
+                model2, str(last2_path),
+                model_type=args.model_type,
+                epoch=args.epochs,
+                val_macro_f1=macro_f1,
+                per_class_f1={},
+                input_size=args.size,
+                num_classes=num_classes_s2,
+            )
+        print(f"\nDone. Best val macro_f1={best_val_f1:.4f}  -> {out_dir}/best.pt")
+
+    # -----------------------------------------------------------------------
+    # Per-class threshold fitting (on val/calib set, using best checkpoint)
+    # Deterministic quantile-based fitting; guarantees recall=1.0 when requested.
+    # In nested_cv mode val_loader == calib_loader (outer test stays hidden).
+    # -----------------------------------------------------------------------
+    _thresholds    = None
+    _calib_summary = {}
+
+    _calib_mode = getattr(args, "calib_mode", "inner_split")
+
+    # Helper: run inference on a DataLoader and return (probs, labels) arrays
+    def _infer_loader(loader):
+        model.eval()
+        _probs_list, _labels_list = [], []
+        with torch.no_grad():
+            for x, y in loader:
+                x = x.to(device)
+                logits = model(x)
+                if _log_prior is not None:
+                    from disaster_bench.training.losses import logit_adjust as _la
+                    logits = _la(logits, _log_prior, tau=args.logit_adjust_tau)
+                probs = torch.softmax(logits, dim=1).cpu().numpy()
+                _probs_list.extend(probs.tolist())
+                _labels_list.extend(y.tolist())
+        return np.array(_probs_list), np.array(_labels_list)
+
+    _need_threshold_fit = (args.threshold_policy in ("per_class_threshold", "ordinal_threshold")
+                           and not args.two_stage)
+
+    if _need_threshold_fit:
+        _nm   = bool(getattr(args, "never_miss_mode", 0))
+        _dset = "calib" if outer_test_recs is not None else "val"
+        print(f"\n[Threshold] Fitting thresholds ({args.threshold_policy}) on {_dset} set ...")
+        ckpt_best = torch.load(str(best_path), map_location=device, weights_only=False)
+        model.load_state_dict(ckpt_best["model_state_dict"])
+        _all_probs_c, _all_labels_c = _infer_loader(val_loader)
+
+        if args.threshold_policy == "per_class_threshold":
+            _thresholds, _calib_summary = _fit_thresholds(
+                _all_probs_c, _all_labels_c,
+                args.target_recall_minor, args.target_recall_major,
+                never_miss=_nm,
+            )
+        else:  # ordinal_threshold
+            _thresholds, _calib_summary = _fit_thresholds_ordinal(
+                _all_probs_c, _all_labels_c,
+                target_recall_damage=args.target_recall_minor,
+                target_recall_severe=args.target_recall_major,
+                never_miss=_nm,
+            )
+
+        # Save calib predictions for crossfit_pool pooling by sibling folds
+        if (outer_test_recs is not None and _calib_mode == "crossfit_pool"
+                and args.cv_fold is not None and run_dir is not None):
+            _tile_ids_c = [r.get("tile_id", "") for r in val_recs]
+            _calib_npz_path = out_dir / "calib_preds.npz"
+            np.savez_compressed(
+                str(_calib_npz_path),
+                y_true=_all_labels_c,
+                probs=_all_probs_c,
+                tile_ids=np.array(_tile_ids_c, dtype=str),
+            )
+            print(f"  [crossfit_pool] Saved calib preds -> {_calib_npz_path}")
+
+        thr_path = out_dir / "thresholds.json"
+        with open(thr_path, "w") as f:
+            json.dump({
+                "policy":              args.threshold_policy,
+                "thresholds":          _thresholds,
+                "target_recall_minor": args.target_recall_minor,
+                "target_recall_major": args.target_recall_major,
+                "calib_summary":       _calib_summary,
+            }, f, indent=2)
+        print(f"  Saved {thr_path}")
+
+    # -----------------------------------------------------------------------
+    # Run summary JSON
+    # -----------------------------------------------------------------------
+    if run_dir is not None:
+        from disaster_bench.training.losses import compute_class_counts as _cc, \
+            compute_class_prior as _cp
+        _tr_counts = _cc(train_recs).tolist()
+        _tr_prior  = _cp(train_recs).tolist()
+        summary = {
+            "run_id":          args.run_id,
+            "seed":            args.seed,
+            "model_type":      args.model_type,
+            "epochs":          args.epochs,
+            "batch":           args.batch,
+            "lr":              args.lr,
+            "loss":            args.loss,
+            "loss_info":       _loss_info,
+            "weight_mode":     args.weight_mode,
+            "sampler":         bool(args.use_sampler),
+            "sampler_mode":    args.sampler_mode,
+            "sampler_cap":     args.sampler_cap,
+            "logit_adjust":    args.logit_adjust,
+            "logit_adjust_tau": args.logit_adjust_tau,
+            "threshold_policy": args.threshold_policy,
+            "calib_mode":      _calib_mode,
+            "thresholds":      _thresholds,
+            "aug_config":      {
+                "rotate90":    args.aug_rotate90,
+                "affine":      args.aug_affine,
+                "color_jitter": args.aug_color_jitter,
+                "noise":       args.aug_noise,
+            },
+            "train_class_counts": {DAMAGE_CLASSES[i]: int(_tr_counts[i]) for i in range(4)},
+            "train_class_prior":  {DAMAGE_CLASSES[i]: round(_tr_prior[i], 6) for i in range(4)},
+            "best_val_macro_f1":  round(best_val_f1, 4),
+            "n_train":  len(train_recs),
+            "n_val":    len(val_recs),
+        }
+        with open(run_dir / "run_summary.json", "w") as f:
+            json.dump(summary, f, indent=2)
+        print(f"Saved {run_dir}/run_summary.json")
+
+    # -----------------------------------------------------------------------
+    # Nested CV: evaluate on outer (held-out) test fold — no leakage
+    # -----------------------------------------------------------------------
+    if outer_test_recs is not None and outer_test_loader is not None and run_dir is not None:
+        print("\n[NestedCV] Evaluating on outer test fold (held-out, never seen during training) ...")
+        ckpt_best = torch.load(str(best_path), map_location=device, weights_only=False)
+        model.load_state_dict(ckpt_best["model_state_dict"])
+        _all_probs_t, _all_labels_t = _infer_loader(outer_test_loader)
+
+        # --- crossfit_pool: pool calib preds from sibling folds ---
+        _test_thresholds = _thresholds   # default: use inner-split thresholds
+        if (_calib_mode == "crossfit_pool" and args.cv_fold is not None
+                and args.cv_folds_path is not None):
+            print(f"  [crossfit_pool] Loading sibling-fold calib preds ...")
+            _pool_probs_list, _pool_labels_list = [], []
+            _cv_k = 5   # default; could introspect the folds JSON
+            try:
+                with open(args.cv_folds_path) as _f:
+                    _fold_data_pool = json.load(_f)
+                    _cv_k = _fold_data_pool.get("k", 5)
+            except Exception:
+                pass
+            for _sib in range(_cv_k):
+                if _sib == args.cv_fold:
+                    continue   # exclude current fold to prevent leakage
+                _sib_npz = Path(f"models/cv5/fold{_sib}") / "calib_preds.npz"
+                if not _sib_npz.exists():
+                    # Try out_dir-relative path
+                    _out_base = Path(args.out_dir).parent
+                    _sib_npz = _out_base / f"fold{_sib}" / "calib_preds.npz"
+                if _sib_npz.exists():
+                    _d = np.load(str(_sib_npz), allow_pickle=True)
+                    _pool_probs_list.append(_d["probs"])
+                    _pool_labels_list.append(_d["y_true"])
+                    print(f"    loaded fold{_sib}: {len(_d['y_true'])} samples")
+                else:
+                    print(f"    WARNING: calib_preds.npz not found for fold{_sib} "
+                          f"({_sib_npz}) — skipping")
+            if _pool_probs_list:
+                _pool_probs  = np.concatenate(_pool_probs_list,  axis=0)
+                _pool_labels = np.concatenate(_pool_labels_list, axis=0)
+                print(f"  [crossfit_pool] Pooled {len(_pool_labels)} calib samples from "
+                      f"{len(_pool_probs_list)} sibling folds. Refitting thresholds ...")
+                _nm = bool(getattr(args, "never_miss_mode", 0))
+                if args.threshold_policy == "per_class_threshold":
+                    _test_thresholds, _pool_summary = _fit_thresholds(
+                        _pool_probs, _pool_labels,
+                        args.target_recall_minor, args.target_recall_major,
+                        never_miss=_nm,
+                    )
+                else:
+                    _test_thresholds, _pool_summary = _fit_thresholds_ordinal(
+                        _pool_probs, _pool_labels,
+                        target_recall_damage=args.target_recall_minor,
+                        target_recall_severe=args.target_recall_major,
+                        never_miss=_nm,
+                    )
+                thr_pool_path = run_dir / "thresholds_crossfit.json"
+                with open(thr_pool_path, "w") as _f:
+                    json.dump({
+                        "policy": args.threshold_policy,
+                        "thresholds": _test_thresholds,
+                        "calib_summary": _pool_summary,
+                        "n_pooled_samples": int(len(_pool_labels)),
+                        "sibling_folds": [s for s in range(_cv_k) if s != args.cv_fold],
+                    }, _f, indent=2)
+                print(f"  [crossfit_pool] Saved {thr_pool_path}")
+            else:
+                print("  [crossfit_pool] No sibling calib files found; "
+                      "falling back to inner-split thresholds.")
+
+        # --- Argmax metrics ---
+        _preds_argmax  = predict_with_policy(_all_probs_t, "argmax", None)
+        argmax_metrics = _make_eval_metrics_ordinal(
+            _preds_argmax, _all_labels_t, _all_probs_t, "argmax", None
+        )
+        with open(run_dir / "test_metrics_argmax.json", "w") as f:
+            json.dump(argmax_metrics, f, indent=2)
+        print(f"  [test/argmax]  macro_f1={argmax_metrics['macro_f1']:.4f}  "
+              f"FN_minor={argmax_metrics['FN_minor_test']}  "
+              f"FN_major={argmax_metrics['FN_major_test']}  "
+              f"FN_damage={argmax_metrics['FN_damage']}  "
+              f"FN_severe={argmax_metrics['FN_severe']}")
+
+        # --- Thresholded / ordinal metrics ---
+        if _test_thresholds is not None:
+            _policy = args.threshold_policy
+            _preds_thresh  = predict_with_policy(_all_probs_t, _policy, _test_thresholds)
+            thresh_metrics = _make_eval_metrics_ordinal(
+                _preds_thresh, _all_labels_t, _all_probs_t, _policy, _test_thresholds
+            )
+            _out_fname = "test_metrics_ordinal.json" if _policy == "ordinal_threshold" \
+                         else "test_metrics_thresholded.json"
+            with open(run_dir / _out_fname, "w") as f:
+                json.dump(thresh_metrics, f, indent=2)
+            print(f"  [test/{_policy}]  macro_f1={thresh_metrics['macro_f1']:.4f}  "
+                  f"FN_damage={thresh_metrics['FN_damage']}  "
+                  f"FN_severe={thresh_metrics['FN_severe']}  "
+                  f"recall_damage={thresh_metrics['recall_damage']}  "
+                  f"recall_severe={thresh_metrics['recall_severe']}")
+            _fn_total = thresh_metrics["FN_damage"] + thresh_metrics["FN_severe"]
+            if _fn_total == 0:
+                print(f"  [{_policy}] FN_damage=0 FN_severe=0 -> never-miss achieved!")
+
+            # --- Debug dump of missed positives ---
+            _missed_rows = []
+            _labels_arr = np.asarray(_all_labels_t)
+            _preds_arr  = np.asarray(_preds_thresh)
+            _p_damage   = _all_probs_t[:, 1] + _all_probs_t[:, 2] + _all_probs_t[:, 3]
+            _p_severe   = _all_probs_t[:, 2] + _all_probs_t[:, 3]
+            # Missed damage: true label in {1,2,3} but predicted as 0
+            _miss_damage_mask = np.isin(_labels_arr, [1, 2, 3]) & (_preds_arr == 0)
+            # Missed severe: true label in {2,3} but predicted as not in {2,3}
+            _miss_severe_mask = np.isin(_labels_arr, [2, 3]) & ~np.isin(_preds_arr, [2, 3])
+            _missed_mask = _miss_damage_mask | _miss_severe_mask
+            if _missed_mask.any():
+                _miss_idxs = np.where(_missed_mask)[0]
+                for _mi in _miss_idxs:
+                    _row = {
+                        "idx":       int(_mi),
+                        "true_label": int(_labels_arr[_mi]),
+                        "pred_label": int(_preds_arr[_mi]),
+                        "p_no":       round(float(_all_probs_t[_mi, 0]), 6),
+                        "p_minor":    round(float(_all_probs_t[_mi, 1]), 6),
+                        "p_major":    round(float(_all_probs_t[_mi, 2]), 6),
+                        "p_destroyed": round(float(_all_probs_t[_mi, 3]), 6),
+                        "p_damage":   round(float(_p_damage[_mi]), 6),
+                        "p_severe":   round(float(_p_severe[_mi]), 6),
+                        "missed_damage": bool(_miss_damage_mask[_mi]),
+                        "missed_severe": bool(_miss_severe_mask[_mi]),
+                    }
+                    if outer_test_recs is not None and _mi < len(outer_test_recs):
+                        _row["tile_id"] = outer_test_recs[_mi].get("tile_id", "")
+                    _missed_rows.append(_row)
+                _debug_path = run_dir / f"missed_positives_{_policy}.json"
+                with open(_debug_path, "w") as _f:
+                    json.dump(_missed_rows, _f, indent=2)
+                print(f"  [debug] {len(_missed_rows)} missed positives -> {_debug_path}")
+        else:
+            print("  [test] No thresholds fitted — only test_metrics_argmax.json written. "
+                  "Add --threshold_policy per_class_threshold or ordinal_threshold to also write "
+                  "test_metrics_thresholded.json / test_metrics_ordinal.json.")
 
 
 # ---------------------------------------------------------------------------
@@ -790,6 +1639,76 @@ def main() -> None:
                    help="Comma-separated disaster IDs for train, e.g. socal-fire")
     p.add_argument("--val_disasters",   type=str, default=None,
                    help="Comma-separated disaster IDs for val, e.g. santa-rosa-wildfire")
+
+    # Long-tail losses (Deliverable A)
+    p.add_argument("--loss", type=str, default="ce",
+                   choices=["ce", "cb_ce", "focal", "ldam_drw"],
+                   help="Loss function: ce (default), cb_ce, focal, ldam_drw")
+    p.add_argument("--beta",            type=float, default=0.9999,
+                   help="CB beta for cb_ce / focal / ldam_drw DRW phase (default 0.9999)")
+    p.add_argument("--gamma",           type=float, default=2.0,
+                   help="Focal loss gamma (default 2.0)")
+    p.add_argument("--max_m",           type=float, default=0.5,
+                   help="LDAM max margin (default 0.5)")
+    p.add_argument("--ldam_s",          type=float, default=30.0,
+                   help="LDAM logit scale factor (default 30.0)")
+    p.add_argument("--drw_start_epoch", type=int,   default=10,
+                   help="DRW: epoch at which to switch to class-balanced weights (default 10)")
+
+    # Logit adjustment (Deliverable B)
+    p.add_argument("--logit_adjust",       type=str, default="none",
+                   choices=["none", "train_prior"],
+                   help="Logit adjustment at eval time (default none)")
+    p.add_argument("--logit_adjust_tau",   type=float, default=1.0,
+                   help="Logit adjustment tau (default 1.0)")
+    p.add_argument("--logit_adjust_train", type=int, choices=[0, 1], default=0,
+                   help="Apply logit adjustment during training loss (default 0=off)")
+
+    # Sampler mode (Deliverable C)
+    p.add_argument("--sampler_mode", type=str, default="invfreq",
+                   choices=["invfreq", "invfreq_capped", "class_quota_batch"],
+                   help="Sampler strategy when --use_sampler 1 (default invfreq)")
+    p.add_argument("--sampler_cap",  type=float, default=5.0,
+                   help="Per-sample weight cap multiplier for invfreq_capped (default 5.0)")
+
+    # Augmentations (Deliverable D)
+    p.add_argument("--aug_rotate90",     type=float, default=0.0,
+                   help="Probability of random 90/180/270 rotation (default 0.0=off)")
+    p.add_argument("--aug_affine",       type=float, default=0.0,
+                   help="Probability of small affine warp (default 0.0=off)")
+    p.add_argument("--aug_color_jitter", type=float, default=0.0,
+                   help="Probability of brightness/contrast jitter (default 0.0=off)")
+    p.add_argument("--aug_noise",        type=float, default=0.0,
+                   help="Probability of additive Gaussian noise (default 0.0=off)")
+
+    # Threshold policy (Deliverable E)
+    p.add_argument("--threshold_policy", type=str, default="argmax",
+                   choices=["argmax", "per_class_threshold", "ordinal_threshold"],
+                   help="Prediction policy: argmax (default), per_class_threshold, or ordinal_threshold")
+    p.add_argument("--target_recall_minor", type=float, default=0.80,
+                   help="Target recall for minor-damage threshold (default 0.80)")
+    p.add_argument("--target_recall_major", type=float, default=0.80,
+                   help="Target recall for major-damage threshold (default 0.80)")
+
+    # Nested CV + never-miss mode (Deliverables A / C / D)
+    p.add_argument("--nested_cv",       type=int, choices=[0, 1], default=0,
+                   help="Nested CV: train on inner split, eval on outer fold; "
+                        "requires --cv_folds_path + --cv_fold (default 0)")
+    p.add_argument("--calib_fraction",  type=float, default=0.2,
+                   help="Fraction of outer-train tiles held for calibration (default 0.2)")
+    p.add_argument("--calib_seed",      type=int, default=None,
+                   help="RNG seed for calib split (default: same as --seed)")
+    p.add_argument("--selection_metric", type=str, default="macro_f1",
+                   help="Metric for best-checkpoint selection on calib set (default macro_f1)")
+    p.add_argument("--never_miss_mode", type=int, choices=[0, 1], default=0,
+                   help="Force target_recall=1.0 for minor+major (FN=0 mode) (default 0)")
+    p.add_argument("--calib_mode", type=str, default="inner_split",
+                   choices=["inner_split", "crossfit_pool"],
+                   help="Calibration mode: inner_split (default) or crossfit_pool "
+                        "(pool OOF preds from sibling folds for stable threshold fitting)")
+    p.add_argument("--eval_only", type=int, choices=[0, 1], default=0,
+                   help="Skip training; load existing best.pt and run outer-test eval only "
+                        "(use after all folds are trained with --calib_mode crossfit_pool)")
 
     run(p.parse_args())
 
