@@ -54,11 +54,14 @@ DEFAULTS = dict(
 
 def build_cmd(fold: int, extra_args: list[str]) -> list[str]:
     d = DEFAULTS
+    # Flags already in extra_args — don't duplicate them from DEFAULTS
+    _extra_flags = {a for a in extra_args if a.startswith("--")}
     cmd = [
         sys.executable, "scripts/train_damage.py",
         "--index_csv",    d["index_csv"],
         "--crops_dir",    d["crops_dir"],
-        "--model_type",   d["model_type"],
+        # Only include model_type from DEFAULTS when not overridden by extra_args
+        *( ["--model_type", d["model_type"]] if "--model_type" not in _extra_flags else [] ),
         "--epochs",       str(d["epochs"]),
         "--batch",        str(d["batch"]),
         "--lr",           str(d["lr"]),

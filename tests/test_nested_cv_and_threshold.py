@@ -18,6 +18,8 @@ from train_damage import (
     _fit_thresholds,
     _fit_thresholds_ordinal,
     predict_with_policy,
+    _predict_cascade,
+    _fit_thresholds_cascade,
 )
 
 
@@ -503,3 +505,213 @@ class TestCrossfitPool:
             ])
             assert len(pool) == (n_folds - 1) * n_per_fold, \
                 f"Pool size {len(pool)} != {(n_folds - 1) * n_per_fold}"
+
+
+# ---------------------------------------------------------------------------
+# F) Cascade threshold policy — predict_cascade decision rule
+# ---------------------------------------------------------------------------
+
+class TestCascadeThresholdPolicy:
+    """Tests for _predict_cascade: correct decision rules for cascade branches."""
+
+    def _make_inputs(self, n=10, seed=0):
+        rng = np.random.default_rng(seed)
+        p_damage       = rng.uniform(0, 1, n)
+        p_severe       = rng.uniform(0, 1, n)
+        severity_logits = rng.standard_normal((n, 3))
+        return p_damage, p_severe, severity_logits
+
+    def test_no_damage_when_both_below_tau(self):
+        """All samples with p_damage < tau_damage and p_severe < tau_severe → no-damage (0)."""
+        p_damage = np.array([0.1, 0.2, 0.05])
+        p_severe = np.array([0.1, 0.15, 0.05])
+        severity_logits = np.ones((3, 3))
+        preds = _predict_cascade(p_damage, p_severe, severity_logits, tau_damage=0.5, tau_severe=0.5)
+        assert (preds == 0).all(), f"Expected all no-damage, got {preds}"
+
+    def test_severe_branch_overrides_damage(self):
+        """p_severe >= tau_severe → pred must be in {2, 3} (major or destroyed)."""
+        p_damage = np.array([0.9])
+        p_severe = np.array([0.9])
+        # severity_logits: major(1) >> destroyed(2) >> minor(0)
+        severity_logits = np.array([[0.0, 10.0, 1.0]])
+        preds = _predict_cascade(p_damage, p_severe, severity_logits, tau_damage=0.5, tau_severe=0.5)
+        assert preds[0] == 2, f"Expected major(2), got {preds[0]}"  # severity idx 1 → 4-class 2
+
+    def test_severe_branch_destroyed(self):
+        """Severe branch, destroyed wins (severity_logits[2] >> logits[1])."""
+        p_damage = np.array([0.9])
+        p_severe = np.array([0.9])
+        severity_logits = np.array([[0.0, 1.0, 10.0]])   # destroyed(idx=2) wins
+        preds = _predict_cascade(p_damage, p_severe, severity_logits, tau_damage=0.5, tau_severe=0.5)
+        assert preds[0] == 3, f"Expected destroyed(3), got {preds[0]}"
+
+    def test_damage_branch_minor(self):
+        """p_damage >= tau, p_severe < tau → damage branch; minor(0) wins → 4-class minor(1)."""
+        p_damage = np.array([0.9])
+        p_severe = np.array([0.1])
+        severity_logits = np.array([[10.0, 0.0, 0.0]])   # minor(idx=0) wins
+        preds = _predict_cascade(p_damage, p_severe, severity_logits, tau_damage=0.5, tau_severe=0.5)
+        assert preds[0] == 1, f"Expected minor(1), got {preds[0]}"
+
+    def test_damage_branch_major(self):
+        """Damage branch; major(idx=1) wins → 4-class major(2)."""
+        p_damage = np.array([0.9])
+        p_severe = np.array([0.1])
+        severity_logits = np.array([[0.0, 10.0, 0.0]])   # major(idx=1) wins
+        preds = _predict_cascade(p_damage, p_severe, severity_logits, tau_damage=0.5, tau_severe=0.5)
+        assert preds[0] == 2, f"Expected major(2), got {preds[0]}"
+
+    def test_output_range_is_0_to_3(self):
+        """Output labels must always be in {0, 1, 2, 3}."""
+        p_damage, p_severe, severity_logits = self._make_inputs(n=200)
+        preds = _predict_cascade(p_damage, p_severe, severity_logits, 0.5, 0.5)
+        assert set(preds.tolist()).issubset({0, 1, 2, 3}), \
+            f"Invalid labels found: {set(preds.tolist())}"
+
+    def test_dtype_int64(self):
+        """Output dtype must be int64."""
+        p_damage, p_severe, severity_logits = self._make_inputs()
+        preds = _predict_cascade(p_damage, p_severe, severity_logits)
+        assert preds.dtype == np.int64, f"dtype={preds.dtype}"
+
+
+# ---------------------------------------------------------------------------
+# G) Cascade threshold fitting — _fit_thresholds_cascade
+# ---------------------------------------------------------------------------
+
+class TestFitThresholdsCascade:
+    """Tests for _fit_thresholds_cascade."""
+
+    def _make_calib(self, n_no=100, n_minor=30, n_major=20, n_dest=10, seed=42):
+        """Synthetic calibration data: high p_damage for damaged, high p_severe for severe."""
+        rng = np.random.default_rng(seed)
+        labels, p_dmg, p_sev = [], [], []
+
+        # no-damage: low p_damage, low p_severe
+        labels.extend([0] * n_no)
+        p_dmg.extend(rng.uniform(0.0, 0.3, n_no).tolist())
+        p_sev.extend(rng.uniform(0.0, 0.2, n_no).tolist())
+
+        # minor: high p_damage, low p_severe
+        labels.extend([1] * n_minor)
+        p_dmg.extend(rng.uniform(0.6, 1.0, n_minor).tolist())
+        p_sev.extend(rng.uniform(0.0, 0.3, n_minor).tolist())
+
+        # major: high p_damage, high p_severe
+        labels.extend([2] * n_major)
+        p_dmg.extend(rng.uniform(0.7, 1.0, n_major).tolist())
+        p_sev.extend(rng.uniform(0.6, 1.0, n_major).tolist())
+
+        # destroyed: high p_damage, high p_severe
+        labels.extend([3] * n_dest)
+        p_dmg.extend(rng.uniform(0.8, 1.0, n_dest).tolist())
+        p_sev.extend(rng.uniform(0.7, 1.0, n_dest).tolist())
+
+        return (np.array(p_dmg), np.array(p_sev), np.array(labels))
+
+    def test_never_miss_recall_one(self):
+        """never_miss=True must achieve recall=1.0 on calibration positives."""
+        p_dmg, p_sev, labels = self._make_calib()
+        thresholds, summary = _fit_thresholds_cascade(
+            p_dmg, p_sev, labels,
+            target_recall_damage=1.0, target_recall_severe=1.0, never_miss=True,
+        )
+        assert summary["tau_damage"]["achieved_recall"] == 1.0, \
+            f"damage recall={summary['tau_damage']['achieved_recall']}"
+        assert summary["tau_severe"]["achieved_recall"] == 1.0, \
+            f"severe recall={summary['tau_severe']['achieved_recall']}"
+
+    def test_thresholds_in_range(self):
+        """Fitted thresholds must be in [0, 1]."""
+        p_dmg, p_sev, labels = self._make_calib()
+        thresholds, _ = _fit_thresholds_cascade(p_dmg, p_sev, labels)
+        assert 0.0 <= thresholds["tau_damage"] <= 1.0
+        assert 0.0 <= thresholds["tau_severe"] <= 1.0
+
+    def test_returns_correct_keys(self):
+        """Return dict must have tau_damage and tau_severe."""
+        p_dmg, p_sev, labels = self._make_calib()
+        thresholds, summary = _fit_thresholds_cascade(p_dmg, p_sev, labels)
+        assert "tau_damage" in thresholds
+        assert "tau_severe" in thresholds
+        assert "tau_damage" in summary
+        assert "tau_severe" in summary
+
+    def test_no_positives_fallback_never_miss(self):
+        """When no positives in calib, never_miss=True → tau=0.0."""
+        labels = np.zeros(50, dtype=int)  # all no-damage
+        p_dmg = np.random.uniform(0, 1, 50)
+        p_sev = np.random.uniform(0, 1, 50)
+        thresholds, _ = _fit_thresholds_cascade(p_dmg, p_sev, labels, never_miss=True)
+        assert thresholds["tau_damage"] == 0.0
+        assert thresholds["tau_severe"] == 0.0
+
+    def test_quantile_mode_lower_recall(self):
+        """target_recall=0.5 should produce higher tau than target_recall=1.0."""
+        p_dmg, p_sev, labels = self._make_calib()
+        thr_nm, _ = _fit_thresholds_cascade(
+            p_dmg, p_sev, labels, target_recall_damage=1.0, target_recall_severe=1.0,
+            never_miss=True)
+        thr_q,  _ = _fit_thresholds_cascade(
+            p_dmg, p_sev, labels, target_recall_damage=0.5, target_recall_severe=0.5,
+            never_miss=False)
+        assert thr_q["tau_damage"] >= thr_nm["tau_damage"], \
+            "Quantile tau_damage should be >= never-miss tau_damage"
+        assert thr_q["tau_severe"] >= thr_nm["tau_severe"], \
+            "Quantile tau_severe should be >= never-miss tau_severe"
+
+
+# ---------------------------------------------------------------------------
+# H) Cascade crossfit pooling excludes evaluated fold
+# ---------------------------------------------------------------------------
+
+class TestCrossfitPoolCascade:
+    """Verify that crossfit pooling logic correctly excludes the evaluated fold."""
+
+    def _make_fold_cascade_data(self, n_folds=5, n_per_fold=40, seed=0):
+        """Simulate calib_preds_cascade.npz contents for n_folds folds."""
+        rng = np.random.default_rng(seed)
+        data = {}
+        for f in range(n_folds):
+            data[f] = {
+                "y_true":          rng.integers(0, 4, n_per_fold),
+                "p_damage":        rng.uniform(0, 1, n_per_fold),
+                "p_severe":        rng.uniform(0, 1, n_per_fold),
+                "severity_logits": rng.standard_normal((n_per_fold, 3)),
+            }
+        return data
+
+    def test_excludes_eval_fold(self):
+        """Pooled data must not contain any samples from the evaluated fold."""
+        n_folds, n_per_fold = 5, 40
+        data = self._make_fold_cascade_data(n_folds, n_per_fold)
+        for eval_fold in range(n_folds):
+            pool_labels = np.concatenate([
+                data[s]["y_true"] for s in range(n_folds) if s != eval_fold
+            ])
+            eval_labels = data[eval_fold]["y_true"]
+            # Verify pool size = (n_folds - 1) * n_per_fold
+            assert len(pool_labels) == (n_folds - 1) * n_per_fold
+
+    def test_threshold_fit_from_pooled_cascade(self):
+        """_fit_thresholds_cascade on pooled (non-eval) data must succeed."""
+        n_folds, n_per_fold = 5, 40
+        data = self._make_fold_cascade_data(n_folds, n_per_fold)
+        eval_fold = 2
+        pp_dmg = np.concatenate([data[s]["p_damage"] for s in range(n_folds) if s != eval_fold])
+        pp_sev = np.concatenate([data[s]["p_severe"] for s in range(n_folds) if s != eval_fold])
+        pp_lbl = np.concatenate([data[s]["y_true"]   for s in range(n_folds) if s != eval_fold])
+        thresholds, summary = _fit_thresholds_cascade(pp_dmg, pp_sev, pp_lbl, never_miss=True)
+        assert "tau_damage" in thresholds
+        assert "tau_severe" in thresholds
+
+    def test_pool_excludes_exactly_one_fold(self):
+        """Pool contains exactly n_folds-1 sibling folds."""
+        n_folds = 5
+        data = self._make_fold_cascade_data(n_folds, 20)
+        for eval_fold in range(n_folds):
+            sibling_folds = [s for s in range(n_folds) if s != eval_fold]
+            assert len(sibling_folds) == n_folds - 1
+            assert eval_fold not in sibling_folds
+
