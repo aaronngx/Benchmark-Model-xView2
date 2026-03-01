@@ -1,0 +1,47 @@
+### Directory Structure
+
+```
+Benchmark-Model-xView2/
+│
+├── src/disaster_bench/          # Main package (pip-installable)
+│   ├── cli.py                   # Entry point: disaster-bench CLI
+│   ├── data/                    # Dataset I/O and preprocessing
+│   │   ├── io.py                # Scan dataset → index.csv
+│   │   ├── crops.py             # Oracle bbox crops from GT polygons
+│   │   ├── dataset.py           # PyTorch datasets (CropDataset, etc.)
+│   │   ├── polygons.py          # WKT parsing + coordinate scaling
+│   │   ├── rasterize.py         # Polygon → binary mask (numpy)
+│   │   ├── overlays.py          # Debug: draw masks/outlines on images
+│   │   └── pred_instances.py    # Predicted footprint I/O + IoU matching
+│   │
+│   ├── geometry/                # Pixel-level feature extraction
+│   │   ├── features.py          # mask_area, pct_changed, area_change_ratio
+│   │   └── thresholds.py        # change_score → damage class (rules)
+│   │
+│   ├── models/
+│   │   ├── damage/              # All damage classification models
+│   │   │   ├── six_channel.py   # SixChannelCNN + SixChannelCNNLight  ✅ TRAINED
+│   │   │   ├── classifiers.py   # PrePostDiffCNN, SiameseCNN, CentroidPatchCNN  â³ train
+│   │   │   ├── siamese_unet.py  # Pixel-wise damage U-Net (Siamese)  â³ train
+│   │   │   ├── vlm_prompts.py   # JSON schema + prompt templates for VLMs
+│   │   │   └── vlm_wrapper.py   # OpenAI / Gemini / Claude / NVIDIA / Local
+│   │   └── footprints/
+│   │       └── semantic_seg.py  # U-Net footprint detector  â³ train
+│   │
+│   ├── pipelines/               # One file per track
+│   │   ├── track1.py            # Oracle bbox → CNN damage classify  ✅ working
+│   │   ├── track1_deploy.py     # Predicted footprints -> CNN  [working]
+│   │   ├── track2a.py           # Abs-diff + SSIM + edge → thresholds  ✅ working
+│   │   ├── track2b.py           # Pixel severity map → polygon aggr.  ✅ working
+│   │   ├── track3.py            # ML + geometry guardrails  ✅ working
+│   │   └── track4_vlm.py        # VLM (cloud/local, grounded/ungrounded)  â³ API keys
+│   │
+│   └── eval/
+│       ├── matching.py          # Polygon IoU matching (pred → GT)
+│       ├── metrics.py           # macro-F1, FEMA 3-class, confusion matrix, latency
+│       └── report.py            # Write predictions.csv + metrics.json
+│
+├── scripts/
+│   ├── train_damage.py          # Train any damage classifier (--model_type)
+│   ├── train_siamese_unet.py    # Train pixel-wise Siamese U-Net
+│   ├── compare_m

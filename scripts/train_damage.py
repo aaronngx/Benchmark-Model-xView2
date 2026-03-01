@@ -25,6 +25,7 @@ New flags (all default to off/scratch — existing behavior is fully preserved):
   --cv_fold                  fold to use as val set (0..k-1); requires cv_folds_path
   --train_disasters          comma-sep disaster IDs for train (e.g. socal-fire)
   --val_disasters            comma-sep disaster IDs for val (e.g. santa-rosa-wildfire)
+  --skip_dataset_check       0 (default, strict) | 1 to bypass SHA256 check on buildings_v2.csv
 
 Usage:
     python scripts/train_damage.py \\
@@ -804,6 +805,77 @@ def _tile_grouped_calib_split(
 
 
 # ---------------------------------------------------------------------------
+# Dataset integrity check
+# ---------------------------------------------------------------------------
+
+def _check_dataset_integrity(args) -> dict:
+    """
+    Verify buildings_v2.csv matches the SHA256 in dataset_manifest.json.
+    Returns a dict of dataset identity fields to embed in run_summary.json.
+    If manifest does not exist, returns minimal fields with dataset_version='unknown'.
+    Raises SystemExit(1) on hash mismatch.
+    """
+    import hashlib
+    MANIFEST_PATH = Path("data/processed/dataset_manifest.json")
+
+    if not MANIFEST_PATH.exists():
+        print(
+            "[DatasetCheck] WARNING: data/processed/dataset_manifest.json not found. "
+            "Skipping integrity check. Run scripts/build_buildings_csv.py to create it.",
+            file=sys.stderr,
+        )
+        return {
+            "dataset_version": "unknown",
+            "dataset_buildings_csv": None,
+            "dataset_sha256": None,
+            "dataset_index_csv": str(args.index_csv),
+            "dataset_cv_folds_json": None,
+            "dataset_cv_folds_sha256": None,
+        }
+
+    with open(MANIFEST_PATH) as f:
+        manifest = json.load(f)
+
+    csv_path = Path(manifest["buildings_csv"])
+    expected_sha = manifest["buildings_csv_sha256"]
+
+    if not csv_path.exists():
+        print(f"[DatasetCheck] ERROR: buildings CSV not found: {csv_path}", file=sys.stderr)
+        print("  Fix: run scripts/build_buildings_csv.py to regenerate it.", file=sys.stderr)
+        sys.exit(1)
+
+    h = hashlib.sha256()
+    with open(csv_path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    actual_sha = h.hexdigest()
+
+    if actual_sha != expected_sha:
+        print("[DatasetCheck] FATAL: buildings_v2.csv hash mismatch!", file=sys.stderr)
+        print(f"  File    : {csv_path}", file=sys.stderr)
+        print(f"  Expected: {expected_sha}", file=sys.stderr)
+        print(f"  Actual  : {actual_sha}", file=sys.stderr)
+        print("  Fix options:", file=sys.stderr)
+        print("    1) Regenerate: python scripts/build_buildings_csv.py", file=sys.stderr)
+        print("    2) Update manifest: python scripts/build_buildings_csv.py --update_manifest", file=sys.stderr)
+        print("    3) Bypass (NOT recommended): --skip_dataset_check 1", file=sys.stderr)
+        sys.exit(1)
+
+    print(
+        f"[DatasetCheck] OK — dataset_version={manifest['dataset_version']}, "
+        f"n_buildings={manifest['n_buildings_total']}, sha256={actual_sha[:12]}…"
+    )
+    return {
+        "dataset_version":        manifest["dataset_version"],
+        "dataset_buildings_csv":  manifest["buildings_csv"],
+        "dataset_sha256":         actual_sha,
+        "dataset_index_csv":      manifest["index_csv"],
+        "dataset_cv_folds_json":  manifest.get("cv_folds_json"),
+        "dataset_cv_folds_sha256": manifest.get("cv_folds_sha256"),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Main training function
 # ---------------------------------------------------------------------------
 
@@ -844,6 +916,20 @@ def run(args: argparse.Namespace) -> None:
         print("Error: --pretrained_ckpt_path is required when --init_mode pretrained",
               file=sys.stderr)
         sys.exit(1)
+
+    # Dataset integrity check (Step 3)
+    if not getattr(args, "skip_dataset_check", 0):
+        _dataset_fields = _check_dataset_integrity(args)
+    else:
+        print("[DatasetCheck] SKIPPED (--skip_dataset_check 1)")
+        _dataset_fields = {
+            "dataset_version":        "unknown_check_skipped",
+            "dataset_buildings_csv":  None,
+            "dataset_sha256":         None,
+            "dataset_index_csv":      str(args.index_csv),
+            "dataset_cv_folds_json":  None,
+            "dataset_cv_folds_sha256": None,
+        }
 
     # Seed for reproducibility (sampler, weight init, augmentation)
     seed_all(args.seed)
@@ -1173,6 +1259,15 @@ def run(args: argparse.Namespace) -> None:
         if model2 is not None:
             _load_encoder_weights(model2, args.pretrained_ckpt_path, device)
 
+    # Step 6B: freeze encoder (for linear probe or staged fine-tune FT0)
+    _enc_frozen = False
+    if (args.freeze_encoder or args.freeze_epochs > 0) and hasattr(model, "encoder"):
+        for p in model.encoder.parameters():
+            p.requires_grad_(False)
+        _enc_frozen = True
+        mode = "permanently" if args.freeze_encoder else f"for first {args.freeze_epochs} epochs"
+        print(f"  [FT] Encoder frozen {mode}. Only head/fusion params will be trained initially.")
+
     # -----------------------------------------------------------------------
     # Loss / optimizer / scheduler
     # -----------------------------------------------------------------------
@@ -1188,8 +1283,35 @@ def run(args: argparse.Namespace) -> None:
     else:
         weights = weights.to(device)
         criterion = torch.nn.CrossEntropyLoss(weight=weights)
-    optimizer  = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
-    scheduler  = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+    # Build optimizer — split param groups for ViT if encoder_lr_scale != 1.0
+    if (hasattr(model, "encoder") and args.encoder_lr_scale != 1.0
+            and not _enc_frozen and not args.freeze_epochs):
+        _enc_params  = list(model.encoder.parameters())
+        _head_params = [p for p in model.parameters()
+                        if not any(p is ep for ep in _enc_params)]
+        optimizer = torch.optim.AdamW([
+            {"params": _enc_params,  "lr": args.lr * args.encoder_lr_scale},
+            {"params": _head_params, "lr": args.lr},
+        ], weight_decay=1e-4)
+        print(f"  [FT] Param groups: encoder lr={args.lr * args.encoder_lr_scale:.2e}, "
+              f"head lr={args.lr:.2e}")
+    else:
+        optimizer = torch.optim.AdamW(
+            filter(lambda p: p.requires_grad, model.parameters()),
+            lr=args.lr, weight_decay=1e-4,
+        )
+    # Scheduler: optional linear warmup then cosine annealing
+    if args.warmup_epochs > 0:
+        import torch.optim.lr_scheduler as _lrs
+        _warmup = _lrs.LinearLR(optimizer, start_factor=0.01, end_factor=1.0,
+                                total_iters=args.warmup_epochs)
+        _cosine = _lrs.CosineAnnealingLR(optimizer,
+                                         T_max=max(1, args.epochs - args.warmup_epochs))
+        scheduler = _lrs.SequentialLR(optimizer, schedulers=[_warmup, _cosine],
+                                      milestones=[args.warmup_epochs])
+        print(f"  [FT] Warmup for {args.warmup_epochs} epochs, then cosine decay.")
+    else:
+        scheduler  = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
     if args.two_stage and model2 is not None:
         if args.weight_mode == "none":
@@ -1281,6 +1403,30 @@ def run(args: argparse.Namespace) -> None:
     _train_start = 0 if _eval_only else start_epoch
     _train_end   = 0 if _eval_only else args.epochs + 1
     for epoch in range(_train_start, _train_end):
+
+        # --- FT staged unfreeze: unfreeze encoder after freeze_epochs ---
+        if (_enc_frozen and not args.freeze_encoder
+                and args.freeze_epochs > 0 and epoch == args.freeze_epochs + 1):
+            if hasattr(model, "encoder"):
+                for p in model.encoder.parameters():
+                    p.requires_grad_(True)
+                _enc_frozen = False
+                # Rebuild optimizer with split LR groups
+                _enc_params  = list(model.encoder.parameters())
+                _head_params = [p for p in model.parameters()
+                                if not any(p is ep for ep in _enc_params)]
+                enc_lr  = args.lr * args.encoder_lr_scale
+                head_lr = args.lr
+                optimizer = torch.optim.AdamW([
+                    {"params": _enc_params,  "lr": enc_lr},
+                    {"params": _head_params, "lr": head_lr},
+                ], weight_decay=1e-4)
+                remaining = max(1, args.epochs - epoch)
+                scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                    optimizer, T_max=remaining)
+                print(f"  [FT] Epoch {epoch}: encoder unfrozen. "
+                      f"enc_lr={enc_lr:.2e}, head_lr={head_lr:.2e}, "
+                      f"cosine over remaining {remaining} epochs.")
 
         # --- DRW: switch to class-balanced weights at drw_start_epoch ---
         if (not args.two_stage and args.loss == "ldam_drw"
@@ -1756,6 +1902,7 @@ def run(args: argparse.Namespace) -> None:
             "best_val_macro_f1":  round(best_val_f1, 4),
             "n_train":  len(train_recs),
             "n_val":    len(val_recs),
+            **_dataset_fields,
         }
         with open(run_dir / "run_summary.json", "w") as f:
             json.dump(summary, f, indent=2)
@@ -2071,7 +2218,8 @@ def main() -> None:
     p.add_argument("--crops_dir",    default="data/processed/crops_oracle")
     p.add_argument("--out_dir",      default="models/six_channel")
     p.add_argument("--model_type",   default="six_channel",
-                   choices=["six_channel", "pre_post_diff", "siamese", "centroid_patch"])
+                   choices=["six_channel", "pre_post_diff", "siamese", "centroid_patch",
+                            "vit_finetune"])
     p.add_argument("--epochs",       type=int,   default=30)
     p.add_argument("--batch",        type=int,   default=32)
     p.add_argument("--lr",           type=float, default=3e-4)
@@ -2119,12 +2267,31 @@ def main() -> None:
                    choices=["scratch", "pretrained"])
     p.add_argument("--pretrained_ckpt_path", type=str, default=None,
                    help="Encoder checkpoint path (required if init_mode=pretrained)")
+    # Step 6B — ViT fine-tuning controls (prevents catastrophic forgetting)
+    p.add_argument("--freeze_encoder", type=int, choices=[0, 1], default=0,
+                   help="Freeze encoder params after pretrained load (linear probe mode). "
+                        "Only affects models with .encoder attribute (e.g. vit_finetune). "
+                        "(default 0=off)")
+    p.add_argument("--encoder_lr_scale", type=float, default=1.0,
+                   help="LR multiplier for encoder vs head (e.g. 0.1 = 10x smaller LR for "
+                        "encoder, recommended for ViT fine-tuning). (default 1.0=same LR)")
+    p.add_argument("--freeze_epochs", type=int, default=0,
+                   help="Freeze encoder for first N epochs (head-only warm-up), then unfreeze "
+                        "with encoder_lr_scale. Implements FT0->FT1 staged fine-tune. (default 0=off)")
+    p.add_argument("--warmup_epochs", type=int, default=0,
+                   help="Linear LR warmup epochs before cosine schedule. Prevents large LR "
+                        "destroying pretrained features in early steps. (default 0=off)")
 
     # CV — fold-based train/val split (overrides default 80/20 when both are given)
     p.add_argument("--cv_folds_path", type=str, default=None,
                    help="Path to cv_folds JSON (output of make_cv_folds.py)")
     p.add_argument("--cv_fold",       type=int, default=None,
                    help="Which fold to hold out as val (0..k-1)")
+
+    # Dataset integrity check
+    p.add_argument("--skip_dataset_check", type=int, choices=[0, 1], default=0,
+                   help="Skip SHA256 check of buildings_v2.csv vs dataset_manifest.json "
+                        "(default 0=strict; set 1 only when intentionally bypassing)")
 
     # Disaster split — overrides both CV and default 80/20 when both are given
     p.add_argument("--train_disasters", type=str, default=None,
