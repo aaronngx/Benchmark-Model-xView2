@@ -116,6 +116,7 @@ def main() -> None:
         split=np.array(splits),
         tile_id=np.array([r["tile_id"] for r in ordered]),
         uid=np.array([r["uid"] for r in ordered]),
+        building_id=np.array([f"{r['tile_id']}:{r['uid']}" for r in ordered]),
     )
 
     print(f"\nSaved {Z.shape} embeddings -> {out_path}")

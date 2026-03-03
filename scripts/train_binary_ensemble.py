@@ -448,6 +448,14 @@ def main() -> None:
     p.add_argument("--cv_folds_path", type=str, default=None,
                    help="Path to cv_folds JSON; triggers CV mode (pools all positives)")
     p.add_argument("--out_dir",   default="models/binary_ensemble")
+    p.add_argument("--append_change_features", action="store_true",
+                   help="Append 4 cached change features (mean_abs_diff, pct_changed, "
+                        "ssim, edge_diff) to embeddings before training. "
+                        "Requires data/processed/change_feats.npy (run extract_change_features.py).")
+    p.add_argument("--change_feats_path", default="data/processed/change_feats.npy",
+                   help="Path to cached change features .npy (default: data/processed/change_feats.npy)")
+    p.add_argument("--change_feats_ids_path", default="data/processed/change_feats_ids.npy",
+                   help="Path to building_id array aligned with change_feats.npy")
     args = p.parse_args()
 
     try:
@@ -463,7 +471,39 @@ def main() -> None:
     split     = npz["split"]
     tile_id   = npz["tile_id"]
     uid       = npz["uid"]
+    # building_id array (present in NPZ if extracted with updated extract_embeddings.py)
+    if "building_id" in npz:
+        emb_building_ids = npz["building_id"]
+    else:
+        emb_building_ids = np.array([f"{t}:{u}" for t, u in zip(tile_id, uid)])
     print(f"Loaded: {Z.shape}  from {args.embeddings_npz}")
+
+    # --- Append change features (optional) ---
+    if args.append_change_features:
+        cf_path  = Path(args.change_feats_path)
+        cid_path = Path(args.change_feats_ids_path)
+        if not cf_path.exists():
+            print(f"ERROR: change features not found at {cf_path}.\n"
+                  f"  Run: python scripts/extract_change_features.py", file=sys.stderr)
+            sys.exit(1)
+        change_feats = np.load(cf_path).astype(np.float32)          # (M, 4)
+        change_ids   = np.load(cid_path, allow_pickle=True)         # (M,) building_id strings
+
+        # Align change features to embedding order by building_id
+        cf_id_to_idx = {bid: i for i, bid in enumerate(change_ids)}
+        aligned = np.zeros((len(Z), change_feats.shape[1]), dtype=np.float32)
+        n_matched = 0
+        for i, bid in enumerate(emb_building_ids):
+            cf_i = cf_id_to_idx.get(str(bid))
+            if cf_i is not None:
+                aligned[i] = change_feats[cf_i]
+                n_matched += 1
+        if n_matched < len(Z):
+            print(f"  WARNING: {len(Z) - n_matched} buildings had no change features "
+                  f"(zero-filled). Matched: {n_matched}/{len(Z)}", file=sys.stderr)
+        Z = np.hstack([Z, aligned])   # (N, 1540)
+        print(f"Appended change features: Z shape now {Z.shape}  "
+              f"(matched {n_matched}/{len(Z)} buildings)")
 
     classes  = [1, 2] if args.cls == "both" else [int(args.cls)]
     out_dir  = Path(args.out_dir)

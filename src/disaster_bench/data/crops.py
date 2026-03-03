@@ -57,6 +57,7 @@ def make_oracle_crops_for_tile(
     out_dir: str | Path,
     *,
     pad_fraction: float = 0.25,
+    overwrite: bool = False,
 ) -> int:
     """
     For one tile: load pre/post images and post label JSON; for each building
@@ -139,13 +140,27 @@ def make_oracle_crops_for_tile(
                 continue
             crop = src_img[py1:py2, px1:px2].copy()
 
-            # Context crop: padded + thin red polygon outline
+            # Raw crop: no outline — clean training input
+            raw_path = uid_dir / f"{prefix}_raw.png"
+            if overwrite or not raw_path.exists():
+                Image.fromarray(crop).save(raw_path)
+
+            # Context crop: padded + thin red polygon outline (legacy training input)
             outlined = _draw_polygon_outline(crop, poly_local)
-            Image.fromarray(outlined).save(uid_dir / f"{prefix}_bbox.png")
+            bbox_path = uid_dir / f"{prefix}_bbox.png"
+            if overwrite or not bbox_path.exists():
+                Image.fromarray(outlined).save(bbox_path)
+
+            # Explicit outlined name for documentation clarity
+            outlined_path = uid_dir / f"{prefix}_outlined.png"
+            if overwrite or not outlined_path.exists():
+                Image.fromarray(outlined).save(outlined_path)
 
             # Masked crop: non-building pixels blacked out (RGB, not RGBA)
             masked = np.where(mask_3ch > 0, crop, np.uint8(0)).astype(np.uint8)
-            Image.fromarray(masked).save(uid_dir / f"{prefix}_masked.png")
+            masked_path = uid_dir / f"{prefix}_masked.png"
+            if overwrite or not masked_path.exists():
+                Image.fromarray(masked).save(masked_path)
 
         count += 1
     return count

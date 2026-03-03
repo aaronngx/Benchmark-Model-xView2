@@ -951,7 +951,10 @@ def run(args: argparse.Namespace) -> None:
         records = build_centroid_records(args.index_csv)
     else:
         print("Building crop records...")
-        records = build_crop_records(args.index_csv, args.crops_dir)
+        records = build_crop_records(
+            args.index_csv, args.crops_dir,
+            use_raw_crops=bool(getattr(args, "use_raw_crops", 0)),
+        )
 
     label_dist = Counter(r["label"] for r in records)
     print(f"  Total buildings: {len(records)}")
@@ -1902,6 +1905,9 @@ def run(args: argparse.Namespace) -> None:
             "best_val_macro_f1":  round(best_val_f1, 4),
             "n_train":  len(train_recs),
             "n_val":    len(val_recs),
+            "val_tile_ids":   sorted(set(r["tile_id"] for r in val_recs)),
+            "train_tile_ids": sorted(set(r["tile_id"] for r in train_recs)),
+            "use_raw_crops":  bool(getattr(args, "use_raw_crops", 0)),
             **_dataset_fields,
         }
         with open(run_dir / "run_summary.json", "w") as f:
@@ -2292,6 +2298,10 @@ def main() -> None:
     p.add_argument("--skip_dataset_check", type=int, choices=[0, 1], default=0,
                    help="Skip SHA256 check of buildings_v2.csv vs dataset_manifest.json "
                         "(default 0=strict; set 1 only when intentionally bypassing)")
+    p.add_argument("--use_raw_crops", type=int, choices=[0, 1], default=0,
+                   help="Load pre_raw.png/post_raw.png (no GT outline) instead of "
+                        "pre_bbox.png/post_bbox.png. Run make_oracle_crops.py first to "
+                        "backfill _raw.png files (default 0=outlined legacy crops).")
 
     # Disaster split — overrides both CV and default 80/20 when both are given
     p.add_argument("--train_disasters", type=str, default=None,
