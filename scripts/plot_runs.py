@@ -52,9 +52,13 @@ PLOTS = [
      "fp_per_1k_no_minor_vs_epoch.png"),
     ("fp_per_1000_no_major", "FP per 1000 no-damage (→ major)",
      "fp_per_1k_no_major_vs_epoch.png"),
-    ("f1_minor",   "F1 minor-damage",  "f1_minor_vs_epoch.png"),
-    ("f1_major",   "F1 major-damage",  "f1_major_vs_epoch.png"),
-    ("macro_f1",   "Macro F1 (4-class)", "macro_f1_vs_epoch.png"),
+    ("f1_minor",    "F1 minor-damage",         "f1_minor_vs_epoch.png"),
+    ("f1_major",    "F1 major-damage",         "f1_major_vs_epoch.png"),
+    ("prec_minor",  "Precision minor-damage",  "prec_minor_vs_epoch.png"),
+    ("prec_major",  "Precision major-damage",  "prec_major_vs_epoch.png"),
+    ("rec_minor",   "Recall minor-damage",     "rec_minor_vs_epoch.png"),
+    ("rec_major",   "Recall major-damage",     "rec_major_vs_epoch.png"),
+    ("macro_f1",    "Macro F1 (4-class)",      "macro_f1_vs_epoch.png"),
 ]
 
 

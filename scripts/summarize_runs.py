@@ -37,6 +37,8 @@ METHOD_GROUPS: dict[str, list[str]] = {
 METRICS = [
     "macro_f1",
     "f1_minor", "f1_major",
+    "prec_minor", "prec_major",
+    "rec_minor", "rec_major",
     "fp_per_1000_no_minor", "fp_per_1000_no_major",
     "pred_minor", "pred_major",
 ]
@@ -85,13 +87,17 @@ def main() -> None:
 
     # Print a quick table to stdout
     print("\n--- Best epoch per run ---")
-    hdr = f"{'run_id':<26} {'ep':>3}  {'mF1':>6}  {'F1min':>6}  {'F1maj':>6}  "
-    hdr += f"{'FP/1k_min':>9}  {'FP/1k_maj':>9}"
+    hdr = (f"{'run_id':<26} {'ep':>3}  {'mF1':>6}  "
+           f"{'F1min':>6}  {'Pmin':>6}  {'Rmin':>6}  "
+           f"{'F1maj':>6}  {'Pmaj':>6}  {'Rmaj':>6}  "
+           f"{'FP/1k_min':>9}  {'FP/1k_maj':>9}")
     print(hdr)
     print("-" * len(hdr))
     for r in best_rows:
         print(f"{r['run_id']:<26} {r['best_epoch']:>3}  "
-              f"{r['macro_f1']:>6.4f}  {r['f1_minor']:>6.4f}  {r['f1_major']:>6.4f}  "
+              f"{r['macro_f1']:>6.4f}  "
+              f"{r['f1_minor']:>6.4f}  {r['prec_minor']:>6.4f}  {r['rec_minor']:>6.4f}  "
+              f"{r['f1_major']:>6.4f}  {r['prec_major']:>6.4f}  {r['rec_major']:>6.4f}  "
               f"{r['fp_per_1000_no_minor']:>9.1f}  {r['fp_per_1000_no_major']:>9.1f}")
 
     # -----------------------------------------------------------------------
