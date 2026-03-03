@@ -1,0 +1,460 @@
+{
+  "dataset_manifest_path": "data/processed/dataset_manifest.json",
+  "dataset_version": "v2_filtered_unclassified_removed",
+  "data_version_note": "Some legacy tracks used v1_unfiltered (n_eval=8498); do not compare directly to v2 tracks (n_eval=8316).",
+
+  "_meta": {
+    "generated": "2026-02-26",
+    "project": "xView2 Wildfire Building Damage Benchmark",
+    "scope": "socal-fire + santa-rosa-wildfire",
+    "classes": ["no-damage", "minor-damage", "major-damage", "destroyed"],
+    "class_labels": [0, 1, 2, 3],
+    "dataset": {
+      "total_buildings": 8316,
+      "no_damage": 6805,
+      "minor_damage": 47,
+      "major_damage": 44,
+      "destroyed": 1420,
+      "total_tiles": 224,
+      "excluded_unclassified": 182,
+      "excluded_unclassified_pct": 2.14
+    },
+    "note": "All metrics from runs/ and reports/ directories. Confusion matrices use row=true, col=predicted."
+  },
+
+  "single_split_benchmark": {
+    "_description": "3 methods × 3 seeds, 80/20 tile-grouped split (seed=42), SixChannelCNN, 30 epochs",
+    "methods": {
+      "baseline": {
+        "description": "normalized_invfreq weights, no sampler",
+        "n_seeds": 3,
+        "macro_f1": { "mean": 0.463, "std": 0.0034 },
+        "f1_minor": { "mean": 0.0677, "std": 0.0253 },
+        "f1_major": { "mean": 0.0371, "std": 0.0394 },
+        "fp_per_1000_no_minor": { "mean": 12.1833, "std": 10.8085 },
+        "fp_per_1000_no_major": { "mean": 21.556, "std": 16.2599 },
+        "pred_minor_mean": 14.3,
+        "pred_major_mean": 35.3
+      },
+      "sampler_capped": {
+        "description": "WeightedRandomSampler + capped_floored weights [0.25, 5.0]",
+        "n_seeds": 3,
+        "macro_f1": { "mean": 0.4669, "std": 0.0013 },
+        "f1_minor": { "mean": 0.071, "std": 0.0348 },
+        "f1_major": { "mean": 0.0599, "std": 0.0272 },
+        "fp_per_1000_no_minor": { "mean": 32.8023, "std": 9.5116 },
+        "fp_per_1000_no_major": { "mean": 22.8053, "std": 3.2916 },
+        "pred_minor_mean": 44.0,
+        "pred_major_mean": 39.0
+      },
+      "sampler_noweights": {
+        "description": "WeightedRandomSampler + equal CE weights (weight_mode=none) — WINNER",
+        "n_seeds": 3,
+        "macro_f1": { "mean": 0.5147, "std": 0.0052 },
+        "f1_minor": { "mean": 0.1598, "std": 0.0758 },
+        "f1_major": { "mean": 0.1254, "std": 0.0631 },
+        "fp_per_1000_no_minor": { "mean": 14.995, "std": 7.3199 },
+        "fp_per_1000_no_major": { "mean": 11.2463, "std": 2.8115 },
+        "pred_minor_mean": 22.7,
+        "pred_major_mean": 22.3,
+        "fema_macro_f1_seed1": 0.6433,
+        "fema_per_class_f1_seed1": {
+          "intact": 0.935,
+          "damaged": 0.149,
+          "destroyed": 0.846
+        }
+      }
+    }
+  },
+
+  "track_comparison": {
+    "_description": "All tracks evaluated on full wildfire scope (8,316 buildings). Source: runs/*/metrics.json",
+    "tracks": {
+      "track1_six_channel": {
+        "description": "Track 1 — Oracle GT bbox crop → SixChannelCNN (6-ch pre+post)",
+        "run_id": "track1_final",
+        "model": "SixChannelCNN",
+        "input": "oracle_bbox",
+        "coverage": 1.0,
+        "n_eval": 8316,
+        "dataset_version": "v2_filtered_unclassified_removed",
+        "macro_f1": 0.4865,
+        "fema_macro_f1": 0.6131,
+        "per_class": {
+          "no-damage":    { "precision": 0.9716, "recall": 0.9049, "f1": 0.9371, "support": 6805 },
+          "minor-damage": { "precision": 0.0659, "recall": 0.234,  "f1": 0.1028, "support": 47 },
+          "major-damage": { "precision": 0.0691, "recall": 0.5682, "f1": 0.1232, "support": 44 },
+          "destroyed":    { "precision": 0.775,  "recall": 0.7908, "f1": 0.7829, "support": 1420 }
+        },
+        "fema_per_class": {
+          "intact":    0.9371,
+          "damaged":   0.1194,
+          "destroyed": 0.7829
+        },
+        "confusion_matrix": {
+          "rows_are_true_cols_are_pred": true,
+          "no-damage":    [6158, 151, 186, 310],
+          "minor-damage": [  28,  11,   0,   8],
+          "major-damage": [  10,   1,  25,   8],
+          "destroyed":    [ 142,   4, 151, 1123]
+        },
+        "severity_mae": 0.2538,
+        "severity_exact_acc": 0.8799,
+        "avg_latency_ms": null
+      },
+
+      "track1_pre_post_diff": {
+        "description": "Track 1 — Oracle GT bbox crop → PrePostDiffCNN (9-ch pre+post+diff)",
+        "run_id": "track1_ppd",
+        "model": "PrePostDiffCNN",
+        "input": "oracle_bbox",
+        "coverage": 1.0,
+        "n_eval": 8316,
+        "dataset_version": "v2_filtered_unclassified_removed",
+        "macro_f1": 0.4363,
+        "fema_macro_f1": 0.5667,
+        "per_class": {
+          "no-damage":    { "precision": 0.9674, "recall": 0.8201, "f1": 0.8877, "support": 6805 },
+          "minor-damage": { "precision": 0.0286, "recall": 0.4043, "f1": 0.0534, "support": 47 },
+          "major-damage": { "precision": 0.0319, "recall": 0.3636, "f1": 0.0586, "support": 44 },
+          "destroyed":    { "precision": 0.756,  "recall": 0.7352, "f1": 0.7454, "support": 1420 }
+        },
+        "fema_per_class": {
+          "intact":    0.8877,
+          "damaged":   0.0668,
+          "destroyed": 0.7454
+        },
+        "confusion_matrix": {
+          "rows_are_true_cols_are_pred": true,
+          "no-damage":    [5581, 611, 290, 323],
+          "minor-damage": [  21,  19,   3,   4],
+          "major-damage": [  14,   4,  16,  10],
+          "destroyed":    [ 153,  30, 193, 1044]
+        },
+        "severity_mae": 0.3543,
+        "severity_exact_acc": 0.8009,
+        "avg_latency_ms": 3.2
+      },
+
+      "track1_siamese": {
+        "description": "Track 1 — Oracle GT bbox crop → SiameseCNN (dual-stream shared encoder)",
+        "run_id": "track1_siamese",
+        "model": "SiameseCNN",
+        "input": "oracle_bbox",
+        "coverage": 1.0,
+        "n_eval": 8316,
+        "dataset_version": "v2_filtered_unclassified_removed",
+        "macro_f1": 0.4609,
+        "fema_macro_f1": 0.5894,
+        "per_class": {
+          "no-damage":    { "precision": 0.984,  "recall": 0.8038, "f1": 0.8848, "support": 6805 },
+          "minor-damage": { "precision": 0.0507, "recall": 0.4894, "f1": 0.0918, "support": 47 },
+          "major-damage": { "precision": 0.049,  "recall": 0.5455, "f1": 0.0899, "support": 44 },
+          "destroyed":    { "precision": 0.6928, "recall": 0.8845, "f1": 0.777,  "support": 1420 }
+        },
+        "fema_per_class": {
+          "intact":    0.8848,
+          "damaged":   0.1063,
+          "destroyed": 0.777
+        },
+        "confusion_matrix": {
+          "rows_are_true_cols_are_pred": true,
+          "no-damage":    [5470, 419, 384, 532],
+          "minor-damage": [   8,  23,   7,   9],
+          "major-damage": [   3,   1,  24,  16],
+          "destroyed":    [  78,  11,  75, 1256]
+        },
+        "severity_mae": 0.3812,
+        "severity_exact_acc": 0.8145,
+        "avg_latency_ms": 4.36
+      },
+
+      "track1_centroid_patch": {
+        "description": "Track 1 — Oracle bbox centroid patch → CentroidPatchCNN",
+        "run_id": "track1_centroid",
+        "model": "CentroidPatchCNN",
+        "input": "oracle_bbox_centroid",
+        "coverage": 1.0,
+        "n_eval": 8316,
+        "dataset_version": "v2_filtered_unclassified_removed",
+        "macro_f1": 0.554,
+        "fema_macro_f1": 0.6804,
+        "per_class": {
+          "no-damage":    { "precision": 0.9943, "recall": 0.9192, "f1": 0.9553, "support": 6805 },
+          "minor-damage": { "precision": 0.1317, "recall": 0.5745, "f1": 0.2143, "support": 47 },
+          "major-damage": { "precision": 0.094,  "recall": 0.6818, "f1": 0.1653, "support": 44 },
+          "destroyed":    { "precision": 0.8574, "recall": 0.9063, "f1": 0.8812, "support": 1420 }
+        },
+        "fema_per_class": {
+          "intact":    0.9553,
+          "damaged":   0.2049,
+          "destroyed": 0.8812
+        },
+        "confusion_matrix": {
+          "rows_are_true_cols_are_pred": true,
+          "no-damage":    [6255, 162, 190, 198],
+          "minor-damage": [   8,  27,   4,   8],
+          "major-damage": [   4,   2,  30,   8],
+          "destroyed":    [  24,  14,  95, 1287]
+        },
+        "severity_mae": 0.1656,
+        "severity_exact_acc": 0.9138,
+        "avg_latency_ms": 5.47
+      },
+
+      "track1_deploy": {
+        "description": "Track 1-Deploy — Predicted footprint bbox → SixChannelCNN (partial coverage)",
+        "run_id": "track1_deploy",
+        "model": "SixChannelCNN",
+        "input": "predicted_bbox",
+        "coverage": 0.1925,
+        "n_eval": 1601,
+        "dataset_version": "v2_filtered_unclassified_removed",
+        "macro_f1": 0.5101,
+        "fema_macro_f1": 0.6302,
+        "per_class": {
+          "no-damage":    { "precision": 0.9612, "recall": 0.8833, "f1": 0.9206, "support": 1123 },
+          "minor-damage": { "precision": 0.1034, "recall": 0.4615, "f1": 0.169,  "support": 13 },
+          "major-damage": { "precision": 0.068,  "recall": 0.4375, "f1": 0.1176, "support": 16 },
+          "destroyed":    { "precision": 0.875,  "recall": 0.7951, "f1": 0.8331, "support": 449 }
+        },
+        "fema_per_class": {
+          "intact":    0.9206,
+          "damaged":   0.1368,
+          "destroyed": 0.8331
+        },
+        "confusion_matrix": {
+          "rows_are_true_cols_are_pred": true,
+          "no-damage":    [992, 49, 39, 43],
+          "minor-damage": [  5,  6,  0,  2],
+          "major-damage": [  3,  0,  7,  6],
+          "destroyed":    [ 32,  3, 57, 357]
+        },
+        "severity_mae": 0.2723,
+        "severity_exact_acc": 0.8507,
+        "avg_latency_ms": 439.16,
+        "note": "Coverage 19.3% — only buildings matched to predicted footprints are evaluated"
+      },
+
+      "track2a": {
+        "description": "Track 2A — Pixel abs-diff + SSIM + edge → rule-based thresholds",
+        "run_id": "track2a_v2",
+        "model": "rule_based",
+        "input": "oracle_bbox",
+        "coverage": 1.0,
+        "n_eval": 8498,
+        "dataset_version": "v1_unfiltered",
+        "macro_f1": 0.1843,
+        "per_class": {
+          "no-damage":    { "f1": 0.1427 },
+          "minor-damage": { "f1": 0.0056 },
+          "major-damage": { "f1": 0.0093 },
+          "destroyed":    { "f1": 0.5797 }
+        },
+        "note": "n_eval=8498 uses older dataset (pre-filtering); effective scope differs slightly"
+      },
+
+      "track2b": {
+        "description": "Track 2B — Pixel severity map → polygon aggregate → 4-class",
+        "run_id": "track2b_v1",
+        "model": "rule_based",
+        "input": "oracle_bbox",
+        "coverage": 1.0,
+        "n_eval": 8498,
+        "dataset_version": "v1_unfiltered",
+        "macro_f1": 0.1569,
+        "per_class": {
+          "no-damage":    { "f1": 0.0664 },
+          "minor-damage": { "f1": 0.0039 },
+          "major-damage": { "f1": 0.0078 },
+          "destroyed":    { "f1": 0.5494 }
+        },
+        "note": "n_eval=8498 uses older dataset (pre-filtering)"
+      },
+
+      "track2b_learned": {
+        "description": "Track 2B (learned variant) — pixel severity with learned thresholds",
+        "run_id": "track2b_learned_v1",
+        "model": "learned_threshold",
+        "input": "oracle_bbox",
+        "coverage": 1.0,
+        "n_eval": 8316,
+        "dataset_version": "v2_filtered_unclassified_removed",
+        "macro_f1": 0.4315,
+        "fema_macro_f1": 0.5753,
+        "per_class": {
+          "no-damage":    { "precision": 0.9207, "recall": 0.9928, "f1": 0.9554, "support": 6805 },
+          "minor-damage": { "precision": 0.0,    "recall": 0.0,    "f1": 0.0,    "support": 47 },
+          "major-damage": { "precision": 0.0,    "recall": 0.0,    "f1": 0.0,    "support": 44 },
+          "destroyed":    { "precision": 0.9448, "recall": 0.6507, "f1": 0.7706, "support": 1420 }
+        },
+        "avg_latency_ms": 30.02
+      },
+
+      "track3_final": {
+        "description": "Track 3 — ML (SixChannelCNN) + geometry guardrails (area, pct_changed, area_change_ratio)",
+        "run_id": "track3_final",
+        "model": "SixChannelCNN + geometry guardrails",
+        "input": "oracle_bbox",
+        "coverage": 1.0,
+        "n_eval": 8498,
+        "dataset_version": "v1_unfiltered",
+        "macro_f1": 0.4638,
+        "per_class": {
+          "no-damage":    { "f1": 0.9172 },
+          "minor-damage": { "f1": 0.0991 },
+          "major-damage": { "f1": 0.0856 },
+          "destroyed":    { "f1": 0.7532 }
+        },
+        "note": "n_eval=8498 uses older dataset (pre-filtering). For progression see track3_progression below."
+      }
+    },
+
+    "track3_progression": {
+      "_description": "Track 3 development history",
+      "track3_v1":     { "macro_f1": 0.3387, "f1_no_damage": 0.9141, "f1_minor": 0.0,    "f1_major": 0.0124, "f1_dest": 0.4282 },
+      "track3_6ch_v1": { "macro_f1": 0.4068, "f1_no_damage": 0.9224, "f1_minor": 0.0,    "f1_major": 0.0186, "f1_dest": 0.6861 },
+      "track3_final":  { "macro_f1": 0.4638, "f1_no_damage": 0.9172, "f1_minor": 0.0991, "f1_major": 0.0856, "f1_dest": 0.7532 }
+    },
+
+    "track_summary_table": {
+      "_description": "Ranked by macro_F1. Coverage=1.0 unless noted.",
+      "ranking": [
+        { "rank": 1, "track": "track1_centroid_patch",   "macro_f1": 0.554,  "f1_minor": 0.2143, "f1_major": 0.1653, "f1_dest": 0.8812, "fema_f1": 0.6804, "coverage": 1.0 },
+        { "rank": 2, "track": "track1_deploy",           "macro_f1": 0.5101, "f1_minor": 0.169,  "f1_major": 0.1176, "f1_dest": 0.8331, "fema_f1": 0.6302, "coverage": 0.193, "note": "partial coverage only" },
+        { "rank": 3, "track": "track1_six_channel",      "macro_f1": 0.4865, "f1_minor": 0.1028, "f1_major": 0.1232, "f1_dest": 0.7829, "fema_f1": 0.6131, "coverage": 1.0 },
+        { "rank": 4, "track": "track3_final",            "macro_f1": 0.4638, "f1_minor": 0.0991, "f1_major": 0.0856, "f1_dest": 0.7532, "fema_f1": null,   "coverage": 1.0 },
+        { "rank": 5, "track": "track1_siamese",          "macro_f1": 0.4609, "f1_minor": 0.0918, "f1_major": 0.0899, "f1_dest": 0.777,  "fema_f1": 0.5894, "coverage": 1.0 },
+        { "rank": 6, "track": "track1_pre_post_diff",    "macro_f1": 0.4363, "f1_minor": 0.0534, "f1_major": 0.0586, "f1_dest": 0.7454, "fema_f1": 0.5667, "coverage": 1.0 },
+        { "rank": 7, "track": "track2b_learned",         "macro_f1": 0.4315, "f1_minor": 0.0,    "f1_major": 0.0,    "f1_dest": 0.7706, "fema_f1": 0.5753, "coverage": 1.0 },
+        { "rank": 8, "track": "track2a",                 "macro_f1": 0.1843, "f1_minor": 0.0056, "f1_major": 0.0093, "f1_dest": 0.5797, "fema_f1": null,   "coverage": 1.0 },
+        { "rank": 9, "track": "track2b",                 "macro_f1": 0.1569, "f1_minor": 0.0039, "f1_major": 0.0078, "f1_dest": 0.5494, "fema_f1": null,   "coverage": 1.0 }
+      ]
+    }
+  },
+
+  "cross_validation": {
+    "_description": "5-fold tile-grouped CV. Fold assignment: data/processed/cv_folds_k5_seed42.json",
+    "split": "tile_grouped_k5",
+    "fold_json": "data/processed/cv_folds_k5_seed42.json",
+    "recipe": "SixChannelCNN, --use_sampler 1 --weight_mode none, 30 epochs, seed=1",
+
+    "argmax_standard": {
+      "_description": "Standard argmax prediction (no threshold tuning)",
+      "summary": {
+        "macro_f1":          { "mean": 0.4641, "std": 0.0123, "n_folds": 5 },
+        "f1_minor":          { "mean": 0.0134, "std": 0.02,   "n_folds": 5 },
+        "f1_major":          { "mean": 0.0525, "std": 0.0723, "n_folds": 5 },
+        "fp_per_1000_no_minor": { "mean": 29.069, "std": 29.229, "n_folds": 5 },
+        "fp_per_1000_no_major": { "mean": 6.582,  "std": 5.793,  "n_folds": 5 }
+      },
+      "per_fold": [
+        { "fold": 0, "run_id": "cv5_fold0", "best_epoch":  4, "macro_f1": 0.4722, "f1_minor": 0.022,  "f1_major": 0.1194, "fp_per_1k_minor": 53.906, "fp_per_1k_major": 16.406 },
+        { "fold": 1, "run_id": "cv5_fold1", "best_epoch": 28, "macro_f1": 0.4528, "f1_minor": 0.0,    "f1_major": 0.0,    "fp_per_1k_minor":  4.702, "fp_per_1k_major":  5.486 },
+        { "fold": 2, "run_id": "cv5_fold2", "best_epoch": 29, "macro_f1": 0.4781, "f1_minor": 0.0,    "f1_major": 0.1429, "fp_per_1k_minor": 14.222, "fp_per_1k_major":  1.497 },
+        { "fold": 3, "run_id": "cv5_fold3", "best_epoch": 12, "macro_f1": 0.4498, "f1_minor": 0.0449, "f1_major": 0.0,    "fp_per_1k_minor": 66.941, "fp_per_1k_major":  6.179 },
+        { "fold": 4, "run_id": "cv5_fold4", "best_epoch": 22, "macro_f1": 0.4678, "f1_minor": 0.0,    "f1_major": 0.0,    "fp_per_1k_minor":  5.574, "fp_per_1k_major":  3.344 }
+      ]
+    },
+
+    "cascade_never_miss": {
+      "_description": "MultiHeadCNN cascade, never_miss_mode=1. Tau collapses to noise floor (~0.003), FP floods.",
+      "policy": "cascade_threshold",
+      "never_miss_mode": true,
+      "summary": {
+        "macro_f1":                  { "mean": 0.0755, "std": 0.0202, "n_folds": 5 },
+        "f1_minor":                  { "mean": 0.0,    "std": 0.0,    "n_folds": 5 },
+        "f1_major":                  { "mean": 0.004,  "std": 0.009,  "n_folds": 5 },
+        "f1_dest":                   { "mean": 0.2978, "std": 0.0765, "n_folds": 5 },
+        "FN_damage":                 { "mean": 0.0,    "std": 0.0,    "n_folds": 5 },
+        "FN_severe":                 { "mean": 0.0,    "std": 0.0,    "n_folds": 5 },
+        "FP_dmg_per_1k_no":          { "mean": 999.844, "std": 0.349, "n_folds": 5 },
+        "FP_sev_per_1k_nonsevere":   { "mean": 996.678, "std": 1.839, "n_folds": 5 }
+      },
+      "per_fold": [
+        { "fold": 0, "macro_f1": 0.0925, "f1_minor": 0.0, "f1_major": 0.0202, "f1_dest": 0.3498, "FN_damage": 0, "FN_severe": 0, "FP_dmg_per_1k_no": 1000.0,  "FP_sev_per_1k_nonsevere": 996.13, "tau_damage": 0.00262451, "tau_severe": 0.00081465, "pooled_n_calib": 4687 },
+        { "fold": 1, "macro_f1": 0.0856, "f1_minor": 0.0, "f1_major": 0.0,    "f1_dest": 0.341,  "FN_damage": 0, "FN_severe": 0, "FP_dmg_per_1k_no": 999.22,  "FP_sev_per_1k_nonsevere": 995.37, "tau_damage": 0.00262451, "tau_severe": 0.00256837, "pooled_n_calib": 5025 },
+        { "fold": 2, "macro_f1": 0.0889, "f1_minor": 0.0, "f1_major": 0.0,    "f1_dest": 0.3555, "FN_damage": 0, "FN_severe": 0, "FP_dmg_per_1k_no": 1000.0,  "FP_sev_per_1k_nonsevere": 999.26, "tau_damage": 0.00302112, "tau_severe": 0.00081465, "pooled_n_calib": 4669 },
+        { "fold": 3, "macro_f1": 0.0444, "f1_minor": 0.0, "f1_major": 0.0,    "f1_dest": 0.1777, "FN_damage": 0, "FN_severe": 0, "FP_dmg_per_1k_no": 1000.0,  "FP_sev_per_1k_nonsevere": 994.8,  "tau_damage": 0.00262451, "tau_severe": 0.00081465, "pooled_n_calib": 4748 },
+        { "fold": 4, "macro_f1": 0.0662, "f1_minor": 0.0, "f1_major": 0.0,    "f1_dest": 0.2648, "FN_damage": 0, "FN_severe": 0, "FP_dmg_per_1k_no": 1000.0,  "FP_sev_per_1k_nonsevere": 997.83, "tau_damage": 0.00262451, "tau_severe": 0.00081465, "pooled_n_calib": 4907 }
+      ],
+      "interpretation": "FN=0 guaranteed on calibration set but tau collapses to ~0.003 (noise floor) because only 91 minority buildings exist in the full dataset. Result: nearly all buildings flagged as damaged (FP~1000/1k). Not operationally useful at this dataset size."
+    },
+
+    "fold_class_distribution": [
+      { "fold": 0, "tiles": 44, "minor_tiles": 4,  "minor_bldgs": 11, "major_tiles": 9, "major_bldgs": 17, "dest_bldgs": 330 },
+      { "fold": 1, "tiles": 41, "minor_tiles": 8,  "minor_bldgs": 19, "major_tiles": 6, "major_bldgs": 10, "dest_bldgs": 330 },
+      { "fold": 2, "tiles": 53, "minor_tiles": 4,  "minor_bldgs": 11, "major_tiles": 6, "major_bldgs":  7, "dest_bldgs": 361 },
+      { "fold": 3, "tiles": 46, "minor_tiles": 4,  "minor_bldgs":  4, "major_tiles": 2, "major_bldgs":  3, "dest_bldgs": 162 },
+      { "fold": 4, "tiles": 40, "minor_tiles": 2,  "minor_bldgs":  2, "major_tiles": 5, "major_bldgs":  7, "dest_bldgs": 237 }
+    ]
+  },
+
+  "lowo_bootstrap": {
+    "_description": "Leave-One-Wildfire-Out. Bootstrap: n=1000 iterations, tile-cluster resampling, seed=123",
+    "runs": {
+      "run_A": {
+        "run_id": "lowo_train_socal_test_santarosa",
+        "train_disaster": "socal-fire",
+        "test_disaster": "santa-rosa-wildfire",
+        "train_buildings": 4102,
+        "train_tiles": 152,
+        "test_buildings": 4214,
+        "test_tiles": 72,
+        "train_class_dist": { "no_damage": 3583, "minor": 28, "major": 35, "destroyed": 456 },
+        "test_class_dist":  { "no_damage": 3222, "minor": 19, "major":  9, "destroyed": 964 },
+        "best_epoch": 11,
+        "overall_accuracy": 0.878,
+        "bootstrap": {
+          "minor_f1":      { "observed": 0.020, "median": 0.020, "ci_95": [0.000, 0.061] },
+          "minor_prec":    { "observed": null,  "median": 0.012, "ci_95": [0.000, 0.047] },
+          "minor_recall":  { "observed": null,  "median": 0.050, "ci_95": [0.000, 0.105] },
+          "minor_fp_1k_no":{ "observed": 16.4,  "median": 16.1,  "ci_95": [9.8,   25.9]  },
+          "major_f1":      { "observed": 0.024, "median": 0.023, "ci_95": [0.000, 0.063] },
+          "major_prec":    { "observed": null,  "median": 0.013, "ci_95": [0.000, 0.035] },
+          "major_recall":  { "observed": null,  "median": 0.100, "ci_95": [0.000, 0.400] },
+          "major_fp_1k_no":{ "observed": 12.1,  "median": 12.0,  "ci_95": [8.0,   16.8]  }
+        }
+      },
+      "run_B": {
+        "run_id": "lowo_train_santarosa_test_socal",
+        "train_disaster": "santa-rosa-wildfire",
+        "test_disaster": "socal-fire",
+        "train_buildings": 4214,
+        "train_tiles": 72,
+        "test_buildings": 4102,
+        "test_tiles": 152,
+        "train_class_dist": { "no_damage": 3222, "minor": 19, "major":  9, "destroyed": 964 },
+        "test_class_dist":  { "no_damage": 3583, "minor": 28, "major": 35, "destroyed": 456 },
+        "best_epoch": 26,
+        "overall_accuracy": 0.837,
+        "bootstrap": {
+          "minor_f1":      { "observed": 0.057, "median": 0.050, "ci_95": [0.000, 0.147] },
+          "minor_prec":    { "observed": null,  "median": 0.034, "ci_95": [0.000, 0.107] },
+          "minor_recall":  { "observed": null,  "median": 0.095, "ci_95": [0.000, 0.333] },
+          "minor_fp_1k_no":{ "observed": 17.9,  "median": 17.8,  "ci_95": [11.4,  26.0]  },
+          "major_f1":      { "observed": 0.000, "median": 0.000, "ci_95": [0.000, 0.000] },
+          "major_prec":    { "observed": null,  "median": 0.000, "ci_95": [0.000, 0.000] },
+          "major_recall":  { "observed": null,  "median": 0.000, "ci_95": [0.000, 0.000] },
+          "major_fp_1k_no":{ "observed": 8.7,   "median": 8.3,   "ci_95": [4.6,   13.4]  }
+        },
+        "note": "major_f1=0 (median and CI both 0): only 9 major buildings in training set"
+      }
+    },
+    "interpretation": "All minor/major F1 confidence intervals include 0 for both runs. No reliable cross-disaster minor/major detection with current wildfire-only scope."
+  },
+
+  "key_findings": {
+    "best_single_split_macro_f1": 0.5147,
+    "best_single_split_method": "sampler_noweights (SixChannelCNN)",
+    "best_track_macro_f1": 0.554,
+    "best_track": "track1_centroid_patch (CentroidPatchCNN, oracle bbox centroid)",
+    "cv_macro_f1_mean": 0.4641,
+    "cv_macro_f1_std": 0.0123,
+    "minor_major_reliable": false,
+    "minor_major_note": "47 minor + 44 major buildings total. F1 near 0 in most CV folds. All LOWO CIs include 0. Data sparsity prevents reliable detection.",
+    "cascade_never_miss_useful": false,
+    "cascade_never_miss_note": "FN=0 guaranteed but FP~1000/1k (tau collapses to ~0.003). Not operationally useful at current dataset size.",
+    "recommended_next_step": "Expand to more disaster types (hurricane, tornado, flood) to increase minority class counts."
+  }
+}

@@ -25,6 +25,7 @@ New flags (all default to off/scratch — existing behavior is fully preserved):
   --cv_fold                  fold to use as val set (0..k-1); requires cv_folds_path
   --train_disasters          comma-sep disaster IDs for train (e.g. socal-fire)
   --val_disasters            comma-sep disaster IDs for val (e.g. santa-rosa-wildfire)
+  --skip_dataset_check       0 (default, strict) | 1 to bypass SHA256 check on buildings_v2.csv
 
 Usage:
     python scripts/train_damage.py \\
@@ -141,7 +142,7 @@ def _base_sample_weights(records, class_weights_np):
 
 
 def _build_sampler(sample_weights_np, num_samples):
-    """Build WeightedRandomSampler with replacement."""
+    """Build WeightedRandomSampler with replacement (invfreq mode)."""
     import torch
     from torch.utils.data import WeightedRandomSampler
     return WeightedRandomSampler(
@@ -149,6 +150,70 @@ def _build_sampler(sample_weights_np, num_samples):
         num_samples=num_samples,
         replacement=True,
     )
+
+
+def _build_sampler_capped(records, base_w_np, cap: float):
+    """
+    invfreq_capped: same as invfreq but per-sample weight multiplier is capped at `cap`.
+    Reduces extreme repetition of the rarest minority items.
+    """
+    import torch
+    from torch.utils.data import WeightedRandomSampler
+    raw_w = np.array([float(base_w_np[r["label_idx"]]) for r in records], dtype=np.float32)
+    # Compute per-sample multiplier relative to no-damage weight (class 0)
+    w_no = base_w_np[0] if base_w_np[0] > 0 else 1.0
+    capped = np.minimum(raw_w / w_no, cap) * w_no
+    return WeightedRandomSampler(
+        weights=torch.from_numpy(capped).float(),
+        num_samples=len(records),
+        replacement=True,
+    )
+
+
+class _ClassQuotaBatchSampler:
+    """
+    Ensures each batch contains at least 1 minor (class 1) and 1 major (class 2)
+    sample if available in the training set.  Remaining slots filled by invfreq
+    WeightedRandomSampler.  Uses replacement within the quota slots.
+    """
+    def __init__(self, records: list[dict], batch_size: int, base_w_np: np.ndarray) -> None:
+        self.batch_size = batch_size
+        # Index by class
+        self.by_class: dict[int, list[int]] = {}
+        for i, r in enumerate(records):
+            c = r["label_idx"]
+            self.by_class.setdefault(c, []).append(i)
+        # Invfreq weights for filling remaining slots
+        import torch
+        from torch.utils.data import WeightedRandomSampler
+        sw = np.array([float(base_w_np[r["label_idx"]]) for r in records], dtype=np.float32)
+        self._sampler = WeightedRandomSampler(
+            torch.from_numpy(sw).float(), num_samples=len(records), replacement=True
+        )
+        self._n_batches = len(records) // batch_size
+
+    def __iter__(self):
+        import random as _rnd
+        fill_indices = list(self._sampler)
+        fill_pos = 0
+        for _ in range(self._n_batches):
+            batch = []
+            # Quota: 1 minor + 1 major (if class exists)
+            for cls in (1, 2):
+                if self.by_class.get(cls):
+                    batch.append(_rnd.choice(self.by_class[cls]))
+            # Fill remaining slots
+            while len(batch) < self.batch_size:
+                if fill_pos >= len(fill_indices):
+                    fill_indices = list(self._sampler)
+                    fill_pos = 0
+                batch.append(fill_indices[fill_pos])
+                fill_pos += 1
+            _rnd.shuffle(batch)
+            yield batch
+
+    def __len__(self):
+        return self._n_batches
 
 
 def _load_encoder_weights(model, ckpt_path: str, device):
@@ -211,6 +276,606 @@ def _two_stage_predict(x_batch, model1, model2, device):
 
 
 # ---------------------------------------------------------------------------
+# Prediction policy and threshold helpers
+# ---------------------------------------------------------------------------
+
+def predict_with_policy(
+    probs: np.ndarray,
+    policy: str,
+    thresholds: "dict | None",
+) -> np.ndarray:
+    """
+    Apply prediction policy to a (N, C) probability array.
+
+    policy: "argmax" | "per_class_threshold" | "ordinal_threshold"
+    thresholds: dict with optional keys:
+      per_class_threshold: "minor" (float), "major" (float)
+      ordinal_threshold:   "tau_damage" (float), "tau_severe" (float)
+
+    per_class_threshold rule:
+      - If p(minor) >= tau_minor  -> minor_candidate
+      - If p(major) >= tau_major  -> major_candidate
+      - Both candidates: choose the one with larger (p - tau) margin
+      - One candidate: choose it.
+      - No candidates: fallback to argmax over all 4 classes.
+
+    ordinal_threshold rule (cumulative probabilities):
+      p_damage = p(minor) + p(major) + p(destroyed)  [= 1 - p(no_damage)]
+      p_severe = p(major) + p(destroyed)
+      - If p_severe >= tau_severe:
+            predict argmax over {major(2), destroyed(3)}
+      - Elif p_damage >= tau_damage:
+            predict argmax over {minor(1), major(2), destroyed(3)}
+      - Else:
+            predict no-damage (0)
+
+    Returns (N,) int ndarray.
+    """
+    preds = probs.argmax(axis=1).copy()
+    if policy == "argmax" or thresholds is None:
+        return preds
+
+    if policy == "ordinal_threshold":
+        tau_damage = float(thresholds.get("tau_damage", 0.5))
+        tau_severe = float(thresholds.get("tau_severe", 0.5))
+        p_damage = probs[:, 1] + probs[:, 2] + probs[:, 3]   # 1 - p(no_damage)
+        p_severe = probs[:, 2] + probs[:, 3]
+        for i in range(len(probs)):
+            if p_severe[i] >= tau_severe:
+                # choose between major(2) and destroyed(3)
+                preds[i] = 2 if probs[i, 2] >= probs[i, 3] else 3
+            elif p_damage[i] >= tau_damage:
+                # choose among minor(1), major(2), destroyed(3)
+                preds[i] = int(np.argmax(probs[i, 1:]) + 1)
+            else:
+                preds[i] = 0
+        return preds
+
+    # per_class_threshold
+    tau_minor = thresholds.get("minor")
+    tau_major  = thresholds.get("major")
+    if tau_minor is None:
+        tau_minor = 0.5
+    if tau_major is None:
+        tau_major = 0.5
+
+    for i in range(len(probs)):
+        minor_cand = bool(probs[i, 1] >= tau_minor)
+        major_cand = bool(probs[i, 2] >= tau_major)
+        if minor_cand and major_cand:
+            # Tie-break: larger (prob - threshold) margin wins
+            minor_margin = probs[i, 1] - tau_minor
+            major_margin = probs[i, 2] - tau_major
+            preds[i] = 1 if minor_margin >= major_margin else 2
+        elif minor_cand:
+            preds[i] = 1
+        elif major_cand:
+            preds[i] = 2
+        # else: keep argmax fallback
+    return preds
+
+
+def _fit_thresholds(
+    all_probs: np.ndarray,
+    all_labels: np.ndarray,
+    target_recall_minor: float,
+    target_recall_major: float,
+    never_miss: bool,
+) -> "tuple[dict, dict]":
+    """
+    Deterministic per-class threshold fitting (replaces coarse grid search).
+
+    For each class c in {minor(1), major(2)}:
+      S_pos = probs[pos_mask, c]
+      If n_pos == 0:
+        tau = 0.0 (never_miss=True) or 0.5 (never_miss=False)
+      elif target_recall >= 1.0:
+        tau = max(0.0, min(S_pos) - eps)   <- guarantees every calib positive
+      else:
+        tau = quantile(S_pos, 1 - target_recall) - eps   <- largest tau meeting target
+
+    Returns (thresholds: dict, calib_summary: dict).
+    """
+    eps = 1e-6
+    thresholds: dict = {}
+    calib_summary: dict = {}
+
+    for cls_idx, name, target_recall in [
+        (1, "minor", target_recall_minor),
+        (2, "major", target_recall_major),
+    ]:
+        pos_mask  = (all_labels == cls_idx)
+        n_pos     = int(pos_mask.sum())
+        probs_cls = all_probs[:, cls_idx]
+
+        if n_pos == 0:
+            tau = 0.0 if never_miss else 0.5
+            label = "0.0 (never_miss: aggressive flagging)" if never_miss else "0.5 (default)"
+            print(f"  [{name}] WARNING: no positives in calib — cannot fit tau; "
+                  f"using {label}")
+            thresholds[name] = float(tau)
+            calib_summary[name] = {
+                "n_pos": 0, "tau": float(tau),
+                "achieved_recall": None, "fp_calib": None,
+                "fp_per_1k_no_calib": None,
+            }
+            continue
+
+        S_pos = probs_cls[pos_mask]
+
+        if target_recall >= 1.0:
+            tau = max(0.0, float(S_pos.min()) - eps)
+        else:
+            tau = float(np.quantile(S_pos, 1.0 - target_recall)) - eps
+            tau = max(0.0, tau)
+
+        achieved_recall = float((probs_cls[pos_mask] >= tau).sum()) / n_pos
+        fp           = int((probs_cls[~pos_mask] >= tau).sum())
+        n_no         = int((all_labels == 0).sum())
+        fp_per_1k_no = 1000.0 * int((probs_cls[all_labels == 0] >= tau).sum()) / max(n_no, 1)
+
+        print(f"  [{name}] target_recall={target_recall:.2f}  "
+              f"tau={tau:.6f}  achieved_recall={achieved_recall:.4f}  "
+              f"FP_calib={fp}  FP/1k-no={fp_per_1k_no:.1f}")
+
+        thresholds[name]    = float(tau)
+        calib_summary[name] = {
+            "n_pos":              n_pos,
+            "tau":                round(float(tau), 8),
+            "achieved_recall":    round(achieved_recall, 4),
+            "fp_calib":           fp,
+            "fp_per_1k_no_calib": round(fp_per_1k_no, 2),
+        }
+
+    return thresholds, calib_summary
+
+
+def _fit_thresholds_ordinal(
+    all_probs: np.ndarray,
+    all_labels: np.ndarray,
+    target_recall_damage: float,
+    target_recall_severe: float,
+    never_miss: bool,
+) -> "tuple[dict, dict]":
+    """
+    Fit cumulative (ordinal) thresholds for two detection tasks:
+      - damage detection: minor-or-worse (label in {1,2,3})
+      - severe detection: major-or-worse (label in {2,3})
+
+    Scores used:
+      S_damage = p(minor) + p(major) + p(destroyed)   [= 1 - p(no_damage)]
+      S_severe = p(major) + p(destroyed)
+
+    For target_recall >= 1.0:
+      tau = max(0.0, min(S_pos) - eps)   <- guarantees every calib positive
+    Else:
+      tau = quantile(S_pos, 1 - target_recall) - eps
+
+    Returns (thresholds: dict, calib_summary: dict).
+    """
+    eps = 1e-6
+    thresholds: dict = {}
+    calib_summary: dict = {}
+
+    p_damage = all_probs[:, 1] + all_probs[:, 2] + all_probs[:, 3]
+    p_severe = all_probs[:, 2] + all_probs[:, 3]
+
+    tasks = [
+        ("tau_damage", p_damage, np.isin(all_labels, [1, 2, 3]), target_recall_damage,
+         "damage (minor-or-worse)"),
+        ("tau_severe", p_severe, np.isin(all_labels, [2, 3]),    target_recall_severe,
+         "severe (major-or-worse)"),
+    ]
+
+    for key, scores, pos_mask, target_recall, desc in tasks:
+        n_pos = int(pos_mask.sum())
+
+        if n_pos == 0:
+            tau = 0.0 if never_miss else 0.5
+            label = "0.0 (never_miss)" if never_miss else "0.5 (default)"
+            print(f"  [{key}] WARNING: no positives in calib — cannot fit; using {label}")
+            thresholds[key] = float(tau)
+            calib_summary[key] = {
+                "n_pos": 0, "tau": float(tau),
+                "achieved_recall": None, "fp_per_1k_no_calib": None,
+            }
+            continue
+
+        S_pos = scores[pos_mask]
+
+        if target_recall >= 1.0:
+            tau = max(0.0, float(S_pos.min()) - eps)
+        else:
+            tau = float(np.quantile(S_pos, 1.0 - target_recall)) - eps
+            tau = max(0.0, tau)
+
+        achieved_recall = float((scores[pos_mask] >= tau).sum()) / n_pos
+        n_no   = int((all_labels == 0).sum())
+        fp_per_1k_no = 1000.0 * int((scores[all_labels == 0] >= tau).sum()) / max(n_no, 1)
+
+        print(f"  [{key}] {desc}  target_recall={target_recall:.2f}  "
+              f"tau={tau:.6f}  achieved_recall={achieved_recall:.4f}  "
+              f"FP/1k-no={fp_per_1k_no:.1f}")
+
+        thresholds[key] = round(float(tau), 8)
+        calib_summary[key] = {
+            "n_pos":              n_pos,
+            "tau":                round(float(tau), 8),
+            "achieved_recall":    round(achieved_recall, 4),
+            "fp_per_1k_no_calib": round(fp_per_1k_no, 2),
+        }
+
+    return thresholds, calib_summary
+
+
+def _make_eval_metrics(
+    all_preds: "list | np.ndarray",
+    all_labels: "list | np.ndarray",
+    policy: str,
+    thresholds: "dict | None",
+) -> dict:
+    """
+    Full evaluation metrics dict — includes explicit FN counts for minor/major.
+
+    Keys: policy, macro_f1, per_class, n_minor_test, FN_minor_test,
+          recall_minor_test, n_major_test, FN_major_test, recall_major_test,
+          FP_per_1000_no_minor, FP_per_1000_no_major, confusion_matrix,
+          thresholds_used.
+    """
+    _CLS = ["no-damage", "minor-damage", "major-damage", "destroyed"]
+    preds  = np.asarray(all_preds)
+    labels = np.asarray(all_labels)
+
+    f1s, macro_f1, precs, recs = _compute_val_metrics(
+        preds.tolist(), labels.tolist(), num_classes=4
+    )
+    cm = _compute_confusion_matrix(preds.tolist(), labels.tolist(), num_classes=4)
+
+    NO, MINOR, MAJOR = 0, 1, 2
+    n_no    = int((labels == NO).sum())
+    n_minor = int((labels == MINOR).sum())
+    n_major = int((labels == MAJOR).sum())
+    FN_minor = int(((labels == MINOR) & (preds != MINOR)).sum())
+    FN_major = int(((labels == MAJOR) & (preds != MAJOR)).sum())
+    recall_minor = round((n_minor - FN_minor) / n_minor, 4) if n_minor > 0 else None
+    recall_major = round((n_major - FN_major) / n_major, 4) if n_major > 0 else None
+    fp_minor_from_no = int(cm[NO][MINOR])
+    fp_major_from_no = int(cm[NO][MAJOR])
+
+    return {
+        "policy":               policy,
+        "macro_f1":             round(macro_f1, 4),
+        "per_class":            {
+            _CLS[i]: {
+                "f1":   round(f1s[i], 4),
+                "prec": round(precs[i], 4),
+                "rec":  round(recs[i], 4),
+            } for i in range(4)
+        },
+        "n_minor_test":         n_minor,
+        "FN_minor_test":        FN_minor,
+        "recall_minor_test":    recall_minor,
+        "n_major_test":         n_major,
+        "FN_major_test":        FN_major,
+        "recall_major_test":    recall_major,
+        "FP_per_1000_no_minor": round(1000.0 * fp_minor_from_no / max(n_no, 1), 2),
+        "FP_per_1000_no_major": round(1000.0 * fp_major_from_no / max(n_no, 1), 2),
+        "confusion_matrix":     cm.tolist(),
+        "thresholds_used":      thresholds,
+    }
+
+
+def _make_eval_metrics_ordinal(
+    all_preds: "list | np.ndarray",
+    all_labels: "list | np.ndarray",
+    all_probs: "np.ndarray | None",
+    policy: str,
+    thresholds: "dict | None",
+) -> dict:
+    """
+    Evaluation metrics including explicit damage/severe detection tasks.
+
+    damage detection: minor-or-worse (label in {1,2,3}) as positive
+    severe detection:  major-or-worse (label in {2,3}) as positive
+
+    FP_damage_per_1000_no: FP from no-damage buildings classified as any damage
+    FP_severe_per_1000_nonsevere: FP from non-severe classified as severe
+    """
+    base = _make_eval_metrics(all_preds, all_labels, policy, thresholds)
+
+    preds  = np.asarray(all_preds)
+    labels = np.asarray(all_labels)
+
+    # Damage detection task (minor-or-worse)
+    pos_damage  = np.isin(labels, [1, 2, 3])
+    pred_damage = np.isin(preds,  [1, 2, 3])
+    n_pos_damage  = int(pos_damage.sum())
+    n_no          = int((labels == 0).sum())
+    FN_damage     = int((pos_damage & ~pred_damage).sum())
+    FP_damage     = int((~pos_damage & pred_damage).sum())
+    recall_damage = round((n_pos_damage - FN_damage) / n_pos_damage, 4) if n_pos_damage > 0 else None
+    fp_damage_per_1k_no = round(1000.0 * int(((labels == 0) & pred_damage).sum()) / max(n_no, 1), 2)
+
+    # Severe detection task (major-or-worse)
+    pos_severe      = np.isin(labels, [2, 3])
+    pred_severe     = np.isin(preds,  [2, 3])
+    n_pos_severe    = int(pos_severe.sum())
+    n_nonsevere     = int((~pos_severe).sum())
+    FN_severe       = int((pos_severe & ~pred_severe).sum())
+    FP_severe       = int((~pos_severe & pred_severe).sum())
+    recall_severe   = round((n_pos_severe - FN_severe) / n_pos_severe, 4) if n_pos_severe > 0 else None
+    fp_severe_per_1k_nonsevere = round(1000.0 * FP_severe / max(n_nonsevere, 1), 2)
+
+    base.update({
+        "n_pos_damage":              n_pos_damage,
+        "FN_damage":                 FN_damage,
+        "recall_damage":             recall_damage,
+        "FP_damage_per_1000_no":     fp_damage_per_1k_no,
+        "n_pos_severe":              n_pos_severe,
+        "FN_severe":                 FN_severe,
+        "recall_severe":             recall_severe,
+        "FP_severe_per_1000_nonsevere": fp_severe_per_1k_nonsevere,
+    })
+    return base
+
+
+def _predict_cascade(
+    p_damage: np.ndarray,
+    p_severe: np.ndarray,
+    severity_logits: np.ndarray,
+    tau_damage: float = 0.5,
+    tau_severe: float = 0.5,
+) -> np.ndarray:
+    """
+    Cascade prediction rule for MultiHeadCNN outputs.
+
+    severity head indices: 0=minor, 1=major, 2=destroyed
+
+    - if p_severe >= tau_severe:
+        argmax over severity indices {1,2} → map to 4-class {major(2), destroyed(3)}
+    - elif p_damage >= tau_damage:
+        argmax over severity (0..2) → map to 4-class {minor(1), major(2), destroyed(3)}
+    - else: no-damage (0)
+    """
+    N = len(p_damage)
+    preds = np.zeros(N, dtype=np.int64)
+    for i in range(N):
+        if p_severe[i] >= tau_severe:
+            # restricted argmax over severity indices 1 and 2 (major, destroyed)
+            idx = int(np.argmax(severity_logits[i, 1:])) + 1  # 1 or 2 in severity space
+            preds[i] = idx + 1  # severity-1→4-class-2, severity-2→4-class-3
+        elif p_damage[i] >= tau_damage:
+            idx = int(np.argmax(severity_logits[i]))  # 0,1,2 in severity space
+            preds[i] = idx + 1  # severity-0→1, 1→2, 2→3
+        else:
+            preds[i] = 0
+    return preds
+
+
+def _fit_thresholds_cascade(
+    p_damage: np.ndarray,
+    p_severe: np.ndarray,
+    all_labels: np.ndarray,
+    target_recall_damage: float = 1.0,
+    target_recall_severe: float = 1.0,
+    never_miss: bool = True,
+) -> "tuple[dict, dict]":
+    """
+    Fit binary thresholds tau_damage and tau_severe from cascade head sigmoid outputs.
+
+    p_damage: sigmoid(damage_logit) on calibration set — (N,)
+    p_severe: sigmoid(severe_logit) on calibration set — (N,)
+    all_labels: 4-class ground truth {0,1,2,3} — (N,)
+
+    Positive sets:
+      damage positives: labels in {1,2,3}
+      severe  positives: labels in {2,3}
+    """
+    eps = 1e-6
+    thresholds: dict = {}
+    calib_summary: dict = {}
+
+    tasks = [
+        ("tau_damage", p_damage, np.isin(all_labels, [1, 2, 3]),
+         target_recall_damage, "damage (minor-or-worse)"),
+        ("tau_severe", p_severe, np.isin(all_labels, [2, 3]),
+         target_recall_severe, "severe (major-or-worse)"),
+    ]
+
+    for key, scores, pos_mask, target_recall, desc in tasks:
+        n_pos = int(pos_mask.sum())
+
+        if n_pos == 0:
+            tau = 0.0 if never_miss else 0.5
+            label = "0.0 (never_miss)" if never_miss else "0.5 (default)"
+            print(f"  [cascade/{key}] WARNING: no positives in calib — using {label}")
+            thresholds[key] = float(tau)
+            calib_summary[key] = {
+                "n_pos": 0, "tau": float(tau),
+                "achieved_recall": None, "fp_per_1k_no_calib": None,
+            }
+            continue
+
+        S_pos = scores[pos_mask]
+
+        if target_recall >= 1.0:
+            tau = max(0.0, float(S_pos.min()) - eps)
+        else:
+            tau = float(np.quantile(S_pos, 1.0 - target_recall)) - eps
+            tau = max(0.0, tau)
+
+        achieved_recall = float((scores[pos_mask] >= tau).sum()) / n_pos
+        n_no   = int((all_labels == 0).sum())
+        fp_per_1k_no = 1000.0 * int((scores[all_labels == 0] >= tau).sum()) / max(n_no, 1)
+
+        print(f"  [cascade/{key}] {desc}  target_recall={target_recall:.2f}  "
+              f"tau={tau:.6f}  achieved_recall={achieved_recall:.4f}  "
+              f"FP/1k-no={fp_per_1k_no:.1f}")
+
+        thresholds[key] = round(float(tau), 8)
+        calib_summary[key] = {
+            "n_pos":              n_pos,
+            "tau":                round(float(tau), 8),
+            "achieved_recall":    round(achieved_recall, 4),
+            "fp_per_1k_no_calib": round(fp_per_1k_no, 2),
+        }
+
+    return thresholds, calib_summary
+
+
+def _fit_temperature_scalar(logits: np.ndarray, y_binary: np.ndarray) -> float:
+    """
+    Fit a temperature scalar T minimizing NLL for binary sigmoid calibration.
+    Uses scipy.optimize.minimize_scalar (bounded search over [0.01, 10]).
+    Falls back to T=1.0 if scipy is unavailable.
+    """
+    try:
+        from scipy.optimize import minimize_scalar as _ms
+    except ImportError:
+        return 1.0
+    logits = np.asarray(logits, dtype=np.float64)
+    y = np.asarray(y_binary, dtype=np.float64)
+    eps = 1e-7
+
+    def nll(T: float) -> float:
+        T = max(T, 1e-8)
+        s = 1.0 / (1.0 + np.exp(-logits / T))
+        return -float(np.mean(y * np.log(s + eps) + (1 - y) * np.log(1 - s + eps)))
+
+    res = _ms(nll, bounds=(0.01, 10.0), method="bounded")
+    return float(res.x)
+
+
+def _make_eval_metrics_cascade(
+    all_preds: np.ndarray,
+    all_labels: np.ndarray,
+    thresholds: "dict | None",
+    temp_scale: bool = False,
+) -> dict:
+    """
+    Cascade evaluation metrics (wraps _make_eval_metrics_ordinal).
+    Adds tau_damage/tau_severe and temp_scale_stage1 fields.
+    """
+    base = _make_eval_metrics_ordinal(
+        all_preds, all_labels, None, "cascade_threshold", thresholds
+    )
+    base["tau_damage_used"]   = thresholds.get("tau_damage") if thresholds else None
+    base["tau_severe_used"]   = thresholds.get("tau_severe") if thresholds else None
+    base["temp_scale_stage1"] = temp_scale
+    return base
+
+
+def _tile_grouped_calib_split(
+    records: list,
+    calib_fraction: float,
+    seed: int,
+) -> "tuple[list, list]":
+    """
+    Tile-grouped split of records into (train_fit, calib).
+
+    Tries to include some minority (minor/major) tiles in calib for threshold
+    fitting.  Logs a warning if none are available.
+
+    Returns (train_fit_recs, calib_recs).  No tile appears in both sets.
+    """
+    import random as _rnd_inner
+    rng = _rnd_inner.Random(seed)
+
+    tile_ids      = sorted({r["tile_id"] for r in records})
+    minority_set  = {r["tile_id"] for r in records if r["label_idx"] in (1, 2)}
+    minority_list = sorted(minority_set)
+    majority_list = [t for t in tile_ids if t not in minority_set]
+
+    n_calib_total = max(1, int(len(tile_ids) * calib_fraction))
+    n_min_calib   = max(0, int(len(minority_list) * calib_fraction))
+    n_maj_calib   = max(0, n_calib_total - n_min_calib)
+
+    rng.shuffle(minority_list)
+    rng.shuffle(majority_list)
+
+    calib_tiles = set(minority_list[:n_min_calib] + majority_list[:n_maj_calib])
+
+    if not (calib_tiles & minority_set):
+        print("  [NestedCV] WARNING: calib set has no minor/major tiles — "
+              "threshold fitting will use fallback values.")
+
+    train_fit = [r for r in records if r["tile_id"] not in calib_tiles]
+    calib     = [r for r in records if r["tile_id"] in calib_tiles]
+    return train_fit, calib
+
+
+# ---------------------------------------------------------------------------
+# Dataset integrity check
+# ---------------------------------------------------------------------------
+
+def _check_dataset_integrity(args) -> dict:
+    """
+    Verify buildings_v2.csv matches the SHA256 in dataset_manifest.json.
+    Returns a dict of dataset identity fields to embed in run_summary.json.
+    If manifest does not exist, returns minimal fields with dataset_version='unknown'.
+    Raises SystemExit(1) on hash mismatch.
+    """
+    import hashlib
+    MANIFEST_PATH = Path("data/processed/dataset_manifest.json")
+
+    if not MANIFEST_PATH.exists():
+        print(
+            "[DatasetCheck] WARNING: data/processed/dataset_manifest.json not found. "
+            "Skipping integrity check. Run scripts/build_buildings_csv.py to create it.",
+            file=sys.stderr,
+        )
+        return {
+            "dataset_version": "unknown",
+            "dataset_buildings_csv": None,
+            "dataset_sha256": None,
+            "dataset_index_csv": str(args.index_csv),
+            "dataset_cv_folds_json": None,
+            "dataset_cv_folds_sha256": None,
+        }
+
+    with open(MANIFEST_PATH) as f:
+        manifest = json.load(f)
+
+    csv_path = Path(manifest["buildings_csv"])
+    expected_sha = manifest["buildings_csv_sha256"]
+
+    if not csv_path.exists():
+        print(f"[DatasetCheck] ERROR: buildings CSV not found: {csv_path}", file=sys.stderr)
+        print("  Fix: run scripts/build_buildings_csv.py to regenerate it.", file=sys.stderr)
+        sys.exit(1)
+
+    h = hashlib.sha256()
+    with open(csv_path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    actual_sha = h.hexdigest()
+
+    if actual_sha != expected_sha:
+        print("[DatasetCheck] FATAL: buildings_v2.csv hash mismatch!", file=sys.stderr)
+        print(f"  File    : {csv_path}", file=sys.stderr)
+        print(f"  Expected: {expected_sha}", file=sys.stderr)
+        print(f"  Actual  : {actual_sha}", file=sys.stderr)
+        print("  Fix options:", file=sys.stderr)
+        print("    1) Regenerate: python scripts/build_buildings_csv.py", file=sys.stderr)
+        print("    2) Update manifest: python scripts/build_buildings_csv.py --update_manifest", file=sys.stderr)
+        print("    3) Bypass (NOT recommended): --skip_dataset_check 1", file=sys.stderr)
+        sys.exit(1)
+
+    print(
+        f"[DatasetCheck] OK — dataset_version={manifest['dataset_version']}, "
+        f"n_buildings={manifest['n_buildings_total']}, sha256={actual_sha[:12]}…"
+    )
+    return {
+        "dataset_version":        manifest["dataset_version"],
+        "dataset_buildings_csv":  manifest["buildings_csv"],
+        "dataset_sha256":         actual_sha,
+        "dataset_index_csv":      manifest["index_csv"],
+        "dataset_cv_folds_json":  manifest.get("cv_folds_json"),
+        "dataset_cv_folds_sha256": manifest.get("cv_folds_sha256"),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Main training function
 # ---------------------------------------------------------------------------
 
@@ -226,13 +891,45 @@ def run(args: argparse.Namespace) -> None:
         DAMAGE_CLASSES, build_crop_records, train_val_split, CropDataset,
         NineChannelDataset,
     )
-    from disaster_bench.models.damage.classifiers import build_classifier, save_checkpoint
+    from disaster_bench.models.damage.classifiers import (
+        build_classifier, build_multihead_classifier, save_checkpoint,
+    )
+
+    # ---------------------------------------------------------------------------
+    # Never-miss mode: force target_recall=1.0 and threshold_policy
+    # ---------------------------------------------------------------------------
+    if getattr(args, "never_miss_mode", 0):
+        args.target_recall_minor = 1.0
+        args.target_recall_major = 1.0
+        # Use cascade_threshold when cascade_mode is on; else ordinal_threshold
+        if getattr(args, "threshold_policy", "argmax") in ("argmax", "per_class_threshold"):
+            if getattr(args, "cascade_mode", "off") == "multihead":
+                args.threshold_policy = "cascade_threshold"
+            else:
+                args.threshold_policy = "ordinal_threshold"
+        print("[NeverMiss] FN=0 mode active: "
+              "target_recall=1.0, "
+              f"threshold_policy={args.threshold_policy}")
 
     # Validate pretrained args
     if args.init_mode == "pretrained" and not args.pretrained_ckpt_path:
         print("Error: --pretrained_ckpt_path is required when --init_mode pretrained",
               file=sys.stderr)
         sys.exit(1)
+
+    # Dataset integrity check (Step 3)
+    if not getattr(args, "skip_dataset_check", 0):
+        _dataset_fields = _check_dataset_integrity(args)
+    else:
+        print("[DatasetCheck] SKIPPED (--skip_dataset_check 1)")
+        _dataset_fields = {
+            "dataset_version":        "unknown_check_skipped",
+            "dataset_buildings_csv":  None,
+            "dataset_sha256":         None,
+            "dataset_index_csv":      str(args.index_csv),
+            "dataset_cv_folds_json":  None,
+            "dataset_cv_folds_sha256": None,
+        }
 
     # Seed for reproducibility (sampler, weight init, augmentation)
     seed_all(args.seed)
@@ -254,7 +951,10 @@ def run(args: argparse.Namespace) -> None:
         records = build_centroid_records(args.index_csv)
     else:
         print("Building crop records...")
-        records = build_crop_records(args.index_csv, args.crops_dir)
+        records = build_crop_records(
+            args.index_csv, args.crops_dir,
+            use_raw_crops=bool(getattr(args, "use_raw_crops", 0)),
+        )
 
     label_dist = Counter(r["label"] for r in records)
     print(f"  Total buildings: {len(records)}")
@@ -298,6 +998,26 @@ def run(args: argparse.Namespace) -> None:
     else:
         train_recs, val_recs = train_val_split(records, val_fraction=args.val_fraction)
         print(f"\nTrain: {len(train_recs)}  Val: {len(val_recs)}")
+
+    # -----------------------------------------------------------------------
+    # Nested CV: further split outer-train tiles into train_fit + calib
+    # outer_test_recs stays completely hidden until post-training evaluation.
+    # -----------------------------------------------------------------------
+    outer_test_recs = None
+    if getattr(args, "nested_cv", 0) and args.cv_folds_path and args.cv_fold is not None:
+        outer_test_recs = val_recs          # hold out; never used during training
+        _calib_seed = getattr(args, "calib_seed", None) or args.seed
+        train_recs, val_recs = _tile_grouped_calib_split(
+            train_recs,
+            calib_fraction=getattr(args, "calib_fraction", 0.2),
+            seed=_calib_seed,
+        )
+        from collections import Counter as _Ctr
+        _ncv_dist = _Ctr(r["label"] for r in val_recs)
+        print(f"\n[NestedCV fold={args.cv_fold}] "
+              f"train_fit={len(train_recs)}  calib={len(val_recs)}  "
+              f"outer_test={len(outer_test_recs)}")
+        print(f"  Calib dist: { {cls: _ncv_dist.get(cls, 0) for cls in DAMAGE_CLASSES} }")
 
     # -----------------------------------------------------------------------
     # Step 5: two-stage label remapping
@@ -352,11 +1072,20 @@ def run(args: argparse.Namespace) -> None:
         train_ds_base = None
 
     else:
+        aug_config = {
+            "rotate90":     args.aug_rotate90,
+            "affine":       args.aug_affine,
+            "color_jitter": args.aug_color_jitter,
+            "noise":        args.aug_noise,
+        }
         if args.two_stage:
-            train_ds_base    = CropDataset(s1_train_recs, size=args.size, augment=True,  preload=True)
-            s2_train_ds_base = CropDataset(s2_train_recs, size=args.size, augment=True,  preload=True)
+            train_ds_base    = CropDataset(s1_train_recs, size=args.size, augment=True,
+                                           preload=True, aug_config=aug_config)
+            s2_train_ds_base = CropDataset(s2_train_recs, size=args.size, augment=True,
+                                           preload=True, aug_config=aug_config)
         else:
-            train_ds_base    = CropDataset(train_recs, size=args.size, augment=True,  preload=True)
+            train_ds_base    = CropDataset(train_recs, size=args.size, augment=True,
+                                           preload=True, aug_config=aug_config)
             s2_train_ds_base = None
         val_ds_base = CropDataset(val_recs, size=args.size, augment=False, preload=True)
 
@@ -368,6 +1097,20 @@ def run(args: argparse.Namespace) -> None:
             train_ds    = train_ds_base
             s2_train_ds = s2_train_ds_base
             val_ds      = val_ds_base
+
+    # Outer test dataset (nested CV only — never used during the training loop)
+    outer_test_ds     = None
+    outer_test_loader = None
+    if outer_test_recs is not None:
+        if args.model_type == "centroid_patch":
+            outer_test_ds = CentroidDataset(outer_test_recs, size=args.size, augment=False)
+        else:
+            _ot_base = CropDataset(outer_test_recs, size=args.size, augment=False, preload=True)
+            outer_test_ds = (NineChannelDataset(_ot_base)
+                             if args.model_type == "pre_post_diff" else _ot_base)
+        outer_test_loader = DataLoader(outer_test_ds, batch_size=args.batch, shuffle=False,
+                                       collate_fn=collate, num_workers=0)
+        print(f"[NestedCV] outer_test preloaded: {len(outer_test_recs)} buildings")
 
     # -----------------------------------------------------------------------
     # Step 3: loss weights
@@ -389,7 +1132,7 @@ def run(args: argparse.Namespace) -> None:
         s1_base_w_np = _compute_class_weights(s1_train_recs, 3,
                                                "normalized_invfreq", 0.0, 1e9)
     else:
-        # 4-class weights (existing behavior)
+        # 4-class weights (existing behavior when --loss ce)
         raw_w_np = _compute_class_weights(train_recs, 4,
                                            args.weight_mode, args.w_min, args.w_max)
         weights  = torch.from_numpy(raw_w_np).float()
@@ -397,6 +1140,37 @@ def run(args: argparse.Namespace) -> None:
               f"{ {c: round(float(w), 4) for c, w in zip(DAMAGE_CLASSES, weights)} }")
         # Base (unclipped) weights for sampler
         base_w_np = _compute_class_weights(train_recs, 4, "normalized_invfreq", 0.0, 1e9)
+
+    # -----------------------------------------------------------------------
+    # New long-tail losses (cb_ce / focal / ldam_drw)
+    # Computed here after train_recs is established (not inside two_stage branch)
+    # -----------------------------------------------------------------------
+    _loss_counts_np = None   # will be set below if needed
+    _loss_info      = {}
+    if not args.two_stage and args.loss != "ce":
+        from disaster_bench.training.losses import build_criterion as _build_criterion
+        _new_criterion, _loss_info = _build_criterion(
+            loss_type        = args.loss,
+            train_records    = train_recs,
+            beta             = args.beta,
+            gamma            = args.gamma,
+            max_m            = args.max_m,
+            s                = args.ldam_s,
+            drw_start_epoch  = args.drw_start_epoch,
+        )
+        from disaster_bench.training.losses import compute_class_counts as _cc
+        _loss_counts_np = _cc(train_recs)
+        print(f"Loss: {args.loss}  info={_loss_info}")
+
+    # -----------------------------------------------------------------------
+    # Logit adjustment prior (computed from raw train labels, not sampler dist)
+    # -----------------------------------------------------------------------
+    _log_prior = None
+    if args.logit_adjust != "none" and not args.two_stage:
+        from disaster_bench.training.losses import make_log_prior as _mlp
+        _log_prior = _mlp(train_recs, num_classes=4)
+        print(f"Logit adjustment: tau={args.logit_adjust_tau}  "
+              f"prior={[round(float(p), 4) for p in _log_prior.exp().tolist()]}")
 
     # -----------------------------------------------------------------------
     # Step 1: DataLoaders (optional WeightedRandomSampler)
@@ -410,12 +1184,27 @@ def run(args: argparse.Namespace) -> None:
         print("[HNM] use_sampler=0 but use_hard_negative_mining=1; "
               "switching to sampler automatically.")
 
+    _sampler_mode = args.sampler_mode if need_sampler else None
     if need_sampler:
         base_w = s1_base_w_np if args.two_stage else base_w_np
         sample_weights_np = _base_sample_weights(train_records_list, base_w)
-        sampler = _build_sampler(sample_weights_np, len(train_records_list))
-        train_loader = DataLoader(train_ds, batch_size=args.batch, sampler=sampler,
-                                  collate_fn=collate, num_workers=0)
+
+        if _sampler_mode == "invfreq_capped":
+            sampler = _build_sampler_capped(train_records_list, base_w, args.sampler_cap)
+            train_loader = DataLoader(train_ds, batch_size=args.batch, sampler=sampler,
+                                      collate_fn=collate, num_workers=0)
+            print(f"Sampler: invfreq_capped (cap={args.sampler_cap})")
+        elif _sampler_mode == "class_quota_batch":
+            batch_sampler = _ClassQuotaBatchSampler(train_records_list, args.batch, base_w)
+            train_loader = DataLoader(train_ds, batch_sampler=batch_sampler,
+                                      collate_fn=collate, num_workers=0)
+            print("Sampler: class_quota_batch (>=1 minor, >=1 major per batch)")
+        else:
+            # invfreq (default)
+            sampler = _build_sampler(sample_weights_np, len(train_records_list))
+            train_loader = DataLoader(train_ds, batch_size=args.batch, sampler=sampler,
+                                      collate_fn=collate, num_workers=0)
+            print("Sampler: invfreq (WeightedRandomSampler)")
     else:
         train_loader = DataLoader(train_ds, batch_size=args.batch, shuffle=True,
                                   collate_fn=collate, num_workers=0)
@@ -444,7 +1233,15 @@ def run(args: argparse.Namespace) -> None:
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     print(f"\nDevice: {device}")
 
-    if args.two_stage:
+    _cascade_mode = bool(getattr(args, "cascade_mode", "off") == "multihead")
+
+    if _cascade_mode:
+        model = build_multihead_classifier(args.model_type, dropout=args.dropout).to(device)
+        model2 = None
+        num_classes_s1 = None   # not applicable (multi-head outputs)
+        num_classes_s2 = None
+        print(f"Model: MultiHeadCNN (backbone={args.model_type})")
+    elif args.two_stage:
         model  = build_classifier(args.model_type, num_classes=3, dropout=args.dropout).to(device)
         model2 = build_classifier(args.model_type, num_classes=2, dropout=args.dropout).to(device)
         num_classes_s1 = 3
@@ -465,17 +1262,59 @@ def run(args: argparse.Namespace) -> None:
         if model2 is not None:
             _load_encoder_weights(model2, args.pretrained_ckpt_path, device)
 
+    # Step 6B: freeze encoder (for linear probe or staged fine-tune FT0)
+    _enc_frozen = False
+    if (args.freeze_encoder or args.freeze_epochs > 0) and hasattr(model, "encoder"):
+        for p in model.encoder.parameters():
+            p.requires_grad_(False)
+        _enc_frozen = True
+        mode = "permanently" if args.freeze_encoder else f"for first {args.freeze_epochs} epochs"
+        print(f"  [FT] Encoder frozen {mode}. Only head/fusion params will be trained initially.")
+
     # -----------------------------------------------------------------------
     # Loss / optimizer / scheduler
     # -----------------------------------------------------------------------
-    if args.weight_mode == "none":
+    if not args.two_stage and args.loss != "ce":
+        # New long-tail loss (cb_ce / focal / ldam_drw)
+        criterion = _new_criterion
+        # Move any buffers to device
+        criterion = criterion.to(device) if hasattr(criterion, 'to') else criterion
+        print(f"Criterion: {args.loss}")
+    elif args.weight_mode == "none":
         criterion = torch.nn.CrossEntropyLoss()
         print("Criterion: unweighted CrossEntropyLoss (weight_mode=none)")
     else:
         weights = weights.to(device)
         criterion = torch.nn.CrossEntropyLoss(weight=weights)
-    optimizer  = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
-    scheduler  = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+    # Build optimizer — split param groups for ViT if encoder_lr_scale != 1.0
+    if (hasattr(model, "encoder") and args.encoder_lr_scale != 1.0
+            and not _enc_frozen and not args.freeze_epochs):
+        _enc_params  = list(model.encoder.parameters())
+        _head_params = [p for p in model.parameters()
+                        if not any(p is ep for ep in _enc_params)]
+        optimizer = torch.optim.AdamW([
+            {"params": _enc_params,  "lr": args.lr * args.encoder_lr_scale},
+            {"params": _head_params, "lr": args.lr},
+        ], weight_decay=1e-4)
+        print(f"  [FT] Param groups: encoder lr={args.lr * args.encoder_lr_scale:.2e}, "
+              f"head lr={args.lr:.2e}")
+    else:
+        optimizer = torch.optim.AdamW(
+            filter(lambda p: p.requires_grad, model.parameters()),
+            lr=args.lr, weight_decay=1e-4,
+        )
+    # Scheduler: optional linear warmup then cosine annealing
+    if args.warmup_epochs > 0:
+        import torch.optim.lr_scheduler as _lrs
+        _warmup = _lrs.LinearLR(optimizer, start_factor=0.01, end_factor=1.0,
+                                total_iters=args.warmup_epochs)
+        _cosine = _lrs.CosineAnnealingLR(optimizer,
+                                         T_max=max(1, args.epochs - args.warmup_epochs))
+        scheduler = _lrs.SequentialLR(optimizer, schedulers=[_warmup, _cosine],
+                                      milestones=[args.warmup_epochs])
+        print(f"  [FT] Warmup for {args.warmup_epochs} epochs, then cosine decay.")
+    else:
+        scheduler  = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
     if args.two_stage and model2 is not None:
         if args.weight_mode == "none":
@@ -485,6 +1324,38 @@ def run(args: argparse.Namespace) -> None:
             criterion2 = torch.nn.CrossEntropyLoss(weight=s2_weights)
         optimizer2 = torch.optim.AdamW(model2.parameters(), lr=args.lr, weight_decay=1e-4)
         scheduler2 = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer2, T_max=args.epochs)
+
+    # Cascade mode: binary + severity criteria (used when _cascade_mode=True)
+    _criterion_damage = _criterion_severe = _criterion_severity = None
+    _cascade_focal = False
+    if _cascade_mode:
+        from collections import Counter as _CtrC
+        _lbl_c   = _CtrC(r["label_idx"] for r in train_recs)
+        _n_no_c  = max(_lbl_c.get(0, 0), 1)
+        _n_dmg_c = max(_lbl_c.get(1, 0) + _lbl_c.get(2, 0) + _lbl_c.get(3, 0), 1)
+        _n_sev_c = max(_lbl_c.get(2, 0) + _lbl_c.get(3, 0), 1)
+        _n_non_sev_c = max(len(train_recs) - _n_sev_c, 1)
+        _stage1_loss = getattr(args, "stage1_loss", "bce")
+        _stage2_loss = getattr(args, "stage2_loss", "ce")
+        if _stage1_loss == "bce":
+            _criterion_damage = torch.nn.BCEWithLogitsLoss()
+            _criterion_severe = torch.nn.BCEWithLogitsLoss()
+        elif _stage1_loss == "cb_bce":
+            _pw_dmg = torch.tensor([_n_no_c / _n_dmg_c], device=device)
+            _pw_sev = torch.tensor([_n_non_sev_c / _n_sev_c], device=device)
+            _criterion_damage = torch.nn.BCEWithLogitsLoss(pos_weight=_pw_dmg)
+            _criterion_severe = torch.nn.BCEWithLogitsLoss(pos_weight=_pw_sev)
+        else:  # focal — computed inline in training loop
+            _cascade_focal = True
+        if _stage2_loss == "cb_ce":
+            _sev_w = np.array([max(_lbl_c.get(1, 0), 1), max(_lbl_c.get(2, 0), 1),
+                               max(_lbl_c.get(3, 0), 1)], dtype=np.float32)
+            _sev_w = (1.0 / _sev_w) * 3.0 / (1.0 / _sev_w).sum()
+            _criterion_severity = torch.nn.CrossEntropyLoss(
+                weight=torch.tensor(_sev_w, device=device))
+        else:
+            _criterion_severity = torch.nn.CrossEntropyLoss()
+        print(f"[Cascade] stage1_loss={_stage1_loss}  stage2_loss={_stage2_loss}")
 
     # -----------------------------------------------------------------------
     # Checkpoint paths
@@ -514,9 +1385,59 @@ def run(args: argparse.Namespace) -> None:
     f1s, macro_f1 = [0.0] * 4, 0.0
 
     # -----------------------------------------------------------------------
-    # Training loop
+    # eval_only: skip training, load existing best checkpoint, go straight
+    # to threshold fitting + outer-test evaluation (crossfit_pool pooling).
     # -----------------------------------------------------------------------
-    for epoch in range(start_epoch, args.epochs + 1):
+    _eval_only = bool(getattr(args, "eval_only", False))
+    if _eval_only:
+        if not best_path.exists():
+            print(f"[eval_only] ERROR: no checkpoint at {best_path}. "
+                  "Run training first.", file=sys.stderr)
+            sys.exit(1)
+        print(f"[eval_only] Skipping training — loading {best_path}")
+        ckpt_r = torch.load(str(best_path), map_location=device, weights_only=False)
+        model.load_state_dict(ckpt_r["model_state_dict"])
+        best_val_f1 = ckpt_r.get("val_macro_f1", 0.0)
+        print(f"[eval_only] Checkpoint loaded (best_val_f1={best_val_f1:.4f})")
+
+    # -----------------------------------------------------------------------
+    # Training loop  (skipped entirely when --eval_only 1)
+    # -----------------------------------------------------------------------
+    _train_start = 0 if _eval_only else start_epoch
+    _train_end   = 0 if _eval_only else args.epochs + 1
+    for epoch in range(_train_start, _train_end):
+
+        # --- FT staged unfreeze: unfreeze encoder after freeze_epochs ---
+        if (_enc_frozen and not args.freeze_encoder
+                and args.freeze_epochs > 0 and epoch == args.freeze_epochs + 1):
+            if hasattr(model, "encoder"):
+                for p in model.encoder.parameters():
+                    p.requires_grad_(True)
+                _enc_frozen = False
+                # Rebuild optimizer with split LR groups
+                _enc_params  = list(model.encoder.parameters())
+                _head_params = [p for p in model.parameters()
+                                if not any(p is ep for ep in _enc_params)]
+                enc_lr  = args.lr * args.encoder_lr_scale
+                head_lr = args.lr
+                optimizer = torch.optim.AdamW([
+                    {"params": _enc_params,  "lr": enc_lr},
+                    {"params": _head_params, "lr": head_lr},
+                ], weight_decay=1e-4)
+                remaining = max(1, args.epochs - epoch)
+                scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                    optimizer, T_max=remaining)
+                print(f"  [FT] Epoch {epoch}: encoder unfrozen. "
+                      f"enc_lr={enc_lr:.2e}, head_lr={head_lr:.2e}, "
+                      f"cosine over remaining {remaining} epochs.")
+
+        # --- DRW: switch to class-balanced weights at drw_start_epoch ---
+        if (not args.two_stage and args.loss == "ldam_drw"
+                and epoch == args.drw_start_epoch
+                and _loss_counts_np is not None):
+            from disaster_bench.training.losses import apply_drw_weights as _adw
+            _adw(criterion, _loss_counts_np, beta=args.beta, device=device)
+            print(f"  [DRW] Switched to class-balanced weights at epoch {epoch}")
 
         # --- Stage 1 train ---
         model.train()
@@ -530,13 +1451,42 @@ def run(args: argparse.Namespace) -> None:
         for batch_idx, (x, y) in enumerate(train_loader):
             x, y = x.to(device), y.to(device)
             optimizer.zero_grad()
-            logits = model(x)
-            loss   = criterion(logits, y)
+            if _cascade_mode:
+                _d_logit, _s_logit, _sev_logits = model(x)
+                _y_dmg = (y > 0).float()
+                _y_sev = (y >= 2).float()
+                if _cascade_focal:
+                    import torch.nn.functional as _F
+                    _gamma_f = float(getattr(args, "gamma", 2.0))
+                    def _bfocal(logit, tgt, g):
+                        _bce = _F.binary_cross_entropy_with_logits(logit, tgt, reduction="none")
+                        _pt  = torch.sigmoid(logit) * tgt + (1 - torch.sigmoid(logit)) * (1 - tgt)
+                        return ((1 - _pt) ** g * _bce).mean()
+                    _L_dmg = _bfocal(_d_logit, _y_dmg, _gamma_f)
+                    _L_sev = _bfocal(_s_logit, _y_sev, _gamma_f)
+                else:
+                    _L_dmg = _criterion_damage(_d_logit, _y_dmg)
+                    _L_sev = _criterion_severe(_s_logit, _y_sev)
+                _dmg_mask = y > 0
+                if _dmg_mask.any():
+                    _L_severity = _criterion_severity(_sev_logits[_dmg_mask], y[_dmg_mask] - 1)
+                else:
+                    _L_severity = _d_logit.sum() * 0.0
+                loss = _L_dmg + _L_sev + _L_severity
+                with torch.no_grad():
+                    _pd_np = torch.sigmoid(_d_logit).cpu().numpy()
+                    _ps_np = torch.sigmoid(_s_logit).cpu().numpy()
+                    _sl_np = _sev_logits.detach().cpu().numpy()
+                    _cp = _predict_cascade(_pd_np, _ps_np, _sl_np, 0.5, 0.5)
+                    train_correct += int((np.array(_cp) == y.cpu().numpy()).sum())
+            else:
+                logits = model(x)
+                loss   = criterion(logits, y)
+                train_correct += (logits.argmax(1) == y).sum().item()
             loss.backward()
             optimizer.step()
-            train_loss    += loss.item() * len(y)
-            train_correct += (logits.argmax(1) == y).sum().item()
-            train_total   += len(y)
+            train_loss  += loss.item() * len(y)
+            train_total += len(y)
 
             if _do_log and batch_idx < 50:
                 counts = [int((y == c).sum().item()) for c in range(4)]
@@ -571,11 +1521,24 @@ def run(args: argparse.Namespace) -> None:
         with torch.no_grad():
             for x, y in val_loader:
                 x = x.to(device)
-                if args.two_stage and model2 is not None:
+                if _cascade_mode:
+                    _d_l, _s_l, _sv_l = model(x)
+                    _pd = torch.sigmoid(_d_l).cpu().numpy()
+                    _ps = torch.sigmoid(_s_l).cpu().numpy()
+                    _sl = _sv_l.cpu().numpy()
+                    all_preds.extend(_predict_cascade(_pd, _ps, _sl, 0.5, 0.5).tolist())
+                elif args.two_stage and model2 is not None:
                     all_preds.extend(_two_stage_predict(x, model, model2, device))
                 else:
-                    all_preds.extend(model(x).argmax(1).cpu().tolist())
+                    logits = model(x)
+                    if _log_prior is not None:
+                        from disaster_bench.training.losses import logit_adjust as _la
+                        logits = _la(logits, _log_prior, tau=args.logit_adjust_tau)
+                        if args.logit_adjust_train and model.training:
+                            pass  # already applied above
+                    all_preds.extend(logits.argmax(1).cpu().tolist())
                 all_labels.extend(y.tolist())
+
 
         f1s, macro_f1, precs, recs_pc = _compute_val_metrics(all_preds, all_labels, num_classes=4)
 
@@ -667,7 +1630,14 @@ def run(args: argparse.Namespace) -> None:
             all_train_preds = []
             with torch.no_grad():
                 for xb, _ in hnm_loader:
-                    all_train_preds.extend(model(xb.to(device)).argmax(1).cpu().tolist())
+                    if _cascade_mode:
+                        _dl, _sl, _svl = model(xb.to(device))
+                        _pd = torch.sigmoid(_dl).cpu().numpy()
+                        _ps = torch.sigmoid(_sl).cpu().numpy()
+                        all_train_preds.extend(
+                            _predict_cascade(_pd, _ps, _svl.cpu().numpy(), 0.5, 0.5).tolist())
+                    else:
+                        all_train_preds.extend(model(xb.to(device)).argmax(1).cpu().tolist())
 
             # Reset to base weights each epoch, then boost hard negatives
             base_w = s1_base_w_np if args.two_stage else base_w_np
@@ -694,28 +1664,552 @@ def run(args: argparse.Namespace) -> None:
                                       collate_fn=collate, num_workers=0)
 
     # -----------------------------------------------------------------------
-    # Save final checkpoints
+    # Save final checkpoints  (skipped in eval_only mode)
     # -----------------------------------------------------------------------
-    save_checkpoint(
-        model, str(last_path),
-        model_type=args.model_type,
-        epoch=args.epochs,
-        val_macro_f1=macro_f1,
-        per_class_f1={DAMAGE_CLASSES[i]: round(f1s[i], 4) for i in range(4)},
-        input_size=args.size,
-        num_classes=num_classes_s1,
-    )
-    if args.two_stage and model2 is not None:
+    if not _eval_only:
         save_checkpoint(
-            model2, str(last2_path),
+            model, str(last_path),
             model_type=args.model_type,
             epoch=args.epochs,
             val_macro_f1=macro_f1,
-            per_class_f1={},
+            per_class_f1={DAMAGE_CLASSES[i]: round(f1s[i], 4) for i in range(4)},
             input_size=args.size,
-            num_classes=num_classes_s2,
+            num_classes=num_classes_s1,
         )
-    print(f"\nDone. Best val macro_f1={best_val_f1:.4f}  -> {out_dir}/best.pt")
+        if args.two_stage and model2 is not None:
+            save_checkpoint(
+                model2, str(last2_path),
+                model_type=args.model_type,
+                epoch=args.epochs,
+                val_macro_f1=macro_f1,
+                per_class_f1={},
+                input_size=args.size,
+                num_classes=num_classes_s2,
+            )
+        print(f"\nDone. Best val macro_f1={best_val_f1:.4f}  -> {out_dir}/best.pt")
+
+    # -----------------------------------------------------------------------
+    # Per-class threshold fitting (on val/calib set, using best checkpoint)
+    # Deterministic quantile-based fitting; guarantees recall=1.0 when requested.
+    # In nested_cv mode val_loader == calib_loader (outer test stays hidden).
+    # -----------------------------------------------------------------------
+    _thresholds    = None
+    _calib_summary = {}
+
+    _calib_mode = getattr(args, "calib_mode", "inner_split")
+
+    # Helper: run inference on a DataLoader and return (probs, labels) arrays
+    def _infer_loader(loader):
+        model.eval()
+        _probs_list, _labels_list = [], []
+        with torch.no_grad():
+            for x, y in loader:
+                x = x.to(device)
+                logits = model(x)
+                if _log_prior is not None:
+                    from disaster_bench.training.losses import logit_adjust as _la
+                    logits = _la(logits, _log_prior, tau=args.logit_adjust_tau)
+                probs = torch.softmax(logits, dim=1).cpu().numpy()
+                _probs_list.extend(probs.tolist())
+                _labels_list.extend(y.tolist())
+        return np.array(_probs_list), np.array(_labels_list)
+
+    # Helper: cascade inference — returns (p_damage, p_severe, severity_logits, labels)
+    def _infer_loader_cascade(loader):
+        model.eval()
+        _pd_list, _ps_list, _sl_list, _lbl_list = [], [], [], []
+        with torch.no_grad():
+            for x, y in loader:
+                x = x.to(device)
+                _dl, _sl, _svl = model(x)
+                _pd_list.extend(torch.sigmoid(_dl).cpu().numpy().tolist())
+                _ps_list.extend(torch.sigmoid(_sl).cpu().numpy().tolist())
+                _sl_list.extend(_svl.cpu().numpy().tolist())
+                _lbl_list.extend(y.tolist())
+        return (np.array(_pd_list), np.array(_ps_list),
+                np.array(_sl_list), np.array(_lbl_list))
+
+    _need_threshold_fit = (args.threshold_policy in ("per_class_threshold", "ordinal_threshold")
+                           and not args.two_stage and not _cascade_mode)
+    _need_cascade_threshold_fit = (
+        _cascade_mode and args.threshold_policy == "cascade_threshold"
+    )
+
+    if _need_threshold_fit:
+        _nm   = bool(getattr(args, "never_miss_mode", 0))
+        _dset = "calib" if outer_test_recs is not None else "val"
+        print(f"\n[Threshold] Fitting thresholds ({args.threshold_policy}) on {_dset} set ...")
+        ckpt_best = torch.load(str(best_path), map_location=device, weights_only=False)
+        model.load_state_dict(ckpt_best["model_state_dict"])
+        _all_probs_c, _all_labels_c = _infer_loader(val_loader)
+
+        if args.threshold_policy == "per_class_threshold":
+            _thresholds, _calib_summary = _fit_thresholds(
+                _all_probs_c, _all_labels_c,
+                args.target_recall_minor, args.target_recall_major,
+                never_miss=_nm,
+            )
+        else:  # ordinal_threshold
+            _thresholds, _calib_summary = _fit_thresholds_ordinal(
+                _all_probs_c, _all_labels_c,
+                target_recall_damage=args.target_recall_minor,
+                target_recall_severe=args.target_recall_major,
+                never_miss=_nm,
+            )
+
+        # Save calib predictions for crossfit_pool pooling by sibling folds
+        if (outer_test_recs is not None and _calib_mode == "crossfit_pool"
+                and args.cv_fold is not None and run_dir is not None):
+            _tile_ids_c = [r.get("tile_id", "") for r in val_recs]
+            _calib_npz_path = out_dir / "calib_preds.npz"
+            np.savez_compressed(
+                str(_calib_npz_path),
+                y_true=_all_labels_c,
+                probs=_all_probs_c,
+                tile_ids=np.array(_tile_ids_c, dtype=str),
+            )
+            print(f"  [crossfit_pool] Saved calib preds -> {_calib_npz_path}")
+
+        thr_path = out_dir / "thresholds.json"
+        with open(thr_path, "w") as f:
+            json.dump({
+                "policy":              args.threshold_policy,
+                "thresholds":          _thresholds,
+                "target_recall_minor": args.target_recall_minor,
+                "target_recall_major": args.target_recall_major,
+                "calib_summary":       _calib_summary,
+            }, f, indent=2)
+        print(f"  Saved {thr_path}")
+
+    # -----------------------------------------------------------------------
+    # Cascade threshold fitting (on calib set, using best checkpoint)
+    # Fits tau_damage and tau_severe from dedicated binary head outputs.
+    # -----------------------------------------------------------------------
+    _cascade_thresholds = None
+    _cascade_temp_scale = bool(getattr(args, "temp_scale_stage1", 0))
+    _cascade_T_damage   = 1.0
+    _cascade_T_severe   = 1.0
+
+    print(f"\n[CASCADE DEBUG] _cascade_mode={_cascade_mode}  "
+          f"_need_cascade_threshold_fit={_need_cascade_threshold_fit}  "
+          f"threshold_policy={getattr(args, 'threshold_policy', 'N/A')}  "
+          f"_eval_only={_eval_only}  "
+          f"outer_test_recs={'set' if outer_test_recs is not None else 'None'}  "
+          f"run_dir={run_dir}", flush=True)
+
+    if _need_cascade_threshold_fit:
+        _nm   = bool(getattr(args, "never_miss_mode", 0))
+        _dset = "calib" if outer_test_recs is not None else "val"
+        print(f"\n[Cascade Threshold] Fitting tau_damage/tau_severe on {_dset} set ...", flush=True)
+        try:
+            ckpt_best = torch.load(str(best_path), map_location=device, weights_only=False)
+            model.load_state_dict(ckpt_best["model_state_dict"])
+            _cpd_c, _cps_c, _csl_c, _clbl_c = _infer_loader_cascade(val_loader)
+
+            # Optional temperature scaling on calib logits before threshold fitting
+            if _cascade_temp_scale:
+                import torch as _tc
+                # We need raw logits, not sigmoid probs, for temp scaling
+                # Re-collect raw logits from the calib set
+                model.eval()
+                _dl_list, _sl_list2 = [], []
+                with _tc.no_grad():
+                    for _xb, _ in val_loader:
+                        _dl_b, _sl_b, _ = model(_xb.to(device))
+                        _dl_list.extend(_dl_b.cpu().numpy().tolist())
+                        _sl_list2.extend(_sl_b.cpu().numpy().tolist())
+                _dl_np = np.array(_dl_list)
+                _sl_np = np.array(_sl_list2)
+                _y_dmg_np = np.isin(_clbl_c, [1, 2, 3]).astype(float)
+                _y_sev_np = np.isin(_clbl_c, [2, 3]).astype(float)
+                _cascade_T_damage = _fit_temperature_scalar(_dl_np, _y_dmg_np)
+                _cascade_T_severe = _fit_temperature_scalar(_sl_np, _y_sev_np)
+                _cpd_c = 1.0 / (1.0 + np.exp(-_dl_np / _cascade_T_damage))
+                _cps_c = 1.0 / (1.0 + np.exp(-_sl_np / _cascade_T_severe))
+                print(f"  [temp_scale] T_damage={_cascade_T_damage:.4f}  "
+                      f"T_severe={_cascade_T_severe:.4f}")
+
+            _cascade_thresholds, _cascade_calib_summary = _fit_thresholds_cascade(
+                _cpd_c, _cps_c, _clbl_c,
+                target_recall_damage=args.target_recall_minor,
+                target_recall_severe=args.target_recall_major,
+                never_miss=_nm,
+            )
+
+            # Save cascade calib preds for crossfit_pool pooling by sibling folds
+            if (outer_test_recs is not None and _calib_mode == "crossfit_pool"
+                    and args.cv_fold is not None and run_dir is not None):
+                _tile_ids_cc = [r.get("tile_id", "") for r in val_recs]
+                _casc_npz_path = out_dir / "calib_preds_cascade.npz"
+                np.savez_compressed(
+                    str(_casc_npz_path),
+                    y_true=_clbl_c,
+                    p_damage=_cpd_c,
+                    p_severe=_cps_c,
+                    severity_logits=_csl_c,
+                    tile_ids=np.array(_tile_ids_cc, dtype=str),
+                )
+                print(f"  [crossfit_pool] Saved cascade calib preds -> {_casc_npz_path}", flush=True)
+
+            _casc_thr_path = out_dir / "thresholds_cascade.json"
+            with open(_casc_thr_path, "w") as f:
+                json.dump({
+                    "policy":              "cascade_threshold",
+                    "thresholds":          _cascade_thresholds,
+                    "target_recall_minor": args.target_recall_minor,
+                    "target_recall_major": args.target_recall_major,
+                    "temp_scale_stage1":   _cascade_temp_scale,
+                    "T_damage":            round(_cascade_T_damage, 6),
+                    "T_severe":            round(_cascade_T_severe, 6),
+                    "calib_summary":       _cascade_calib_summary,
+                }, f, indent=2)
+            print(f"  Saved {_casc_thr_path}", flush=True)
+        except Exception:
+            import traceback as _tb
+            print("\n[CASCADE ERROR] Exception in cascade threshold fitting:", flush=True)
+            _tb.print_exc()
+            raise
+
+
+    if run_dir is not None:
+        from disaster_bench.training.losses import compute_class_counts as _cc, \
+            compute_class_prior as _cp
+        _tr_counts = _cc(train_recs).tolist()
+        _tr_prior  = _cp(train_recs).tolist()
+        summary = {
+            "run_id":          args.run_id,
+            "seed":            args.seed,
+            "model_type":      args.model_type,
+            "epochs":          args.epochs,
+            "batch":           args.batch,
+            "lr":              args.lr,
+            "loss":            args.loss,
+            "loss_info":       _loss_info,
+            "weight_mode":     args.weight_mode,
+            "sampler":         bool(args.use_sampler),
+            "sampler_mode":    args.sampler_mode,
+            "sampler_cap":     args.sampler_cap,
+            "logit_adjust":    args.logit_adjust,
+            "logit_adjust_tau": args.logit_adjust_tau,
+            "threshold_policy": args.threshold_policy,
+            "calib_mode":      _calib_mode,
+            "thresholds":      _thresholds,
+            "aug_config":      {
+                "rotate90":    args.aug_rotate90,
+                "affine":      args.aug_affine,
+                "color_jitter": args.aug_color_jitter,
+                "noise":       args.aug_noise,
+            },
+            "train_class_counts": {DAMAGE_CLASSES[i]: int(_tr_counts[i]) for i in range(4)},
+            "train_class_prior":  {DAMAGE_CLASSES[i]: round(_tr_prior[i], 6) for i in range(4)},
+            "best_val_macro_f1":  round(best_val_f1, 4),
+            "n_train":  len(train_recs),
+            "n_val":    len(val_recs),
+            "val_tile_ids":   sorted(set(r["tile_id"] for r in val_recs)),
+            "train_tile_ids": sorted(set(r["tile_id"] for r in train_recs)),
+            "use_raw_crops":  bool(getattr(args, "use_raw_crops", 0)),
+            **_dataset_fields,
+        }
+        with open(run_dir / "run_summary.json", "w") as f:
+            json.dump(summary, f, indent=2)
+        print(f"Saved {run_dir}/run_summary.json")
+
+    # -----------------------------------------------------------------------
+    # Nested CV: evaluate on outer (held-out) test fold — no leakage
+    # -----------------------------------------------------------------------
+    if outer_test_recs is not None and outer_test_loader is not None and run_dir is not None:
+        print("\n[NestedCV] Evaluating on outer test fold (held-out, never seen during training) ...",
+              flush=True)
+        try:
+            ckpt_best = torch.load(str(best_path), map_location=device, weights_only=False)
+            model.load_state_dict(ckpt_best["model_state_dict"])
+        except Exception:
+            import traceback as _tb
+            print("[CASCADE ERROR] Failed to load best.pt for outer-test eval:", flush=True)
+            _tb.print_exc()
+            raise
+
+        # ================================================================
+        # CASCADE MODE outer-test eval
+        # ================================================================
+        if _cascade_mode:
+            print(f"  [cascade] Running outer-test inference ...", flush=True)
+            try:
+                _cpd_t, _cps_t, _csl_t, _all_labels_t = _infer_loader_cascade(outer_test_loader)
+                print(f"  [cascade] Inference done: {len(_all_labels_t)} samples", flush=True)
+            except Exception:
+                import traceback as _tb
+                print("[CASCADE ERROR] _infer_loader_cascade failed on outer test:", flush=True)
+                _tb.print_exc()
+                raise
+
+            # --- crossfit_pool for cascade: pool calib_preds_cascade.npz from siblings ---
+            _cascade_test_thresholds = _cascade_thresholds  # fallback: inner-split
+            if (_calib_mode == "crossfit_pool" and args.cv_fold is not None
+                    and args.cv_folds_path is not None):
+                print("  [crossfit_pool/cascade] Loading sibling-fold cascade calib preds ...")
+                _cv_k_c = 5
+                try:
+                    with open(args.cv_folds_path) as _f:
+                        _fold_data_c = json.load(_f)
+                        _cv_k_c = _fold_data_c.get("k", 5)
+                except Exception:
+                    pass
+                _cpool_pd, _cpool_ps, _cpool_sl, _cpool_lbl = [], [], [], []
+                for _sib in range(_cv_k_c):
+                    if _sib == args.cv_fold:
+                        continue
+                    _sib_cnpz = Path(f"models/cv5/fold{_sib}") / "calib_preds_cascade.npz"
+                    if not _sib_cnpz.exists():
+                        _sib_cnpz = Path(args.out_dir).parent / f"fold{_sib}" / "calib_preds_cascade.npz"
+                    if _sib_cnpz.exists():
+                        _cd = np.load(str(_sib_cnpz), allow_pickle=True)
+                        _cpool_pd.append(_cd["p_damage"])
+                        _cpool_ps.append(_cd["p_severe"])
+                        _cpool_sl.append(_cd["severity_logits"])
+                        _cpool_lbl.append(_cd["y_true"])
+                        print(f"    loaded fold{_sib}: {len(_cd['y_true'])} samples")
+                    else:
+                        print(f"    WARNING: calib_preds_cascade.npz not found for fold{_sib} "
+                              f"({_sib_cnpz}) — skipping")
+                if _cpool_pd:
+                    _pp_pd  = np.concatenate(_cpool_pd,  axis=0)
+                    _pp_ps  = np.concatenate(_cpool_ps,  axis=0)
+                    _pp_lbl = np.concatenate(_cpool_lbl, axis=0)
+                    print(f"  [crossfit_pool/cascade] Pooled {len(_pp_lbl)} samples from "
+                          f"{len(_cpool_pd)} sibling folds. Refitting cascade thresholds ...")
+                    _nm_c = bool(getattr(args, "never_miss_mode", 0))
+                    _cascade_test_thresholds, _casc_pool_summary = _fit_thresholds_cascade(
+                        _pp_pd, _pp_ps, _pp_lbl,
+                        target_recall_damage=args.target_recall_minor,
+                        target_recall_severe=args.target_recall_major,
+                        never_miss=_nm_c,
+                    )
+                    _casc_pool_path = run_dir / "thresholds_crossfit.json"
+                    with open(_casc_pool_path, "w") as _f:
+                        json.dump({
+                            "policy": "cascade_threshold",
+                            "thresholds": _cascade_test_thresholds,
+                            "calib_summary": _casc_pool_summary,
+                            "n_pooled_samples": int(len(_pp_lbl)),
+                            "sibling_folds": [s for s in range(_cv_k_c) if s != args.cv_fold],
+                        }, _f, indent=2)
+                    print(f"  [crossfit_pool/cascade] Saved {_casc_pool_path}")
+                else:
+                    print("  [crossfit_pool/cascade] No sibling cascade calib files found; "
+                          "falling back to inner-split thresholds.")
+                    # Still write thresholds_crossfit.json so fold-0-only runs produce the file
+                    if _cascade_thresholds is not None and run_dir is not None:
+                        _casc_pool_path = run_dir / "thresholds_crossfit.json"
+                        with open(_casc_pool_path, "w") as _f:
+                            json.dump({
+                                "policy": "cascade_threshold",
+                                "thresholds": _cascade_thresholds,
+                                "calib_summary": _cascade_calib_summary,
+                                "n_pooled_samples": 0,
+                                "sibling_folds": [],
+                                "note": "inner-split fallback (no sibling calib files found)",
+                            }, _f, indent=2)
+                        print(f"  [crossfit_pool/cascade] Saved fallback {_casc_pool_path}")
+
+            # --- Cascade default (tau=0.5) proxy for comparison ---
+            _preds_casc_argmax = _predict_cascade(_cpd_t, _cps_t, _csl_t, 0.5, 0.5)
+            casc_argmax_metrics = _make_eval_metrics_cascade(
+                _preds_casc_argmax, _all_labels_t, None, temp_scale=False
+            )
+            with open(run_dir / "test_metrics_cascade_argmax.json", "w") as f:
+                json.dump(casc_argmax_metrics, f, indent=2)
+            print(f"  [cascade/argmax-proxy]  macro_f1={casc_argmax_metrics['macro_f1']:.4f}  "
+                  f"FN_damage={casc_argmax_metrics['FN_damage']}  "
+                  f"FN_severe={casc_argmax_metrics['FN_severe']}")
+
+            # --- Cascade threshold metrics ---
+            if _cascade_test_thresholds is not None:
+                _tau_dmg = float(_cascade_test_thresholds.get("tau_damage", 0.5))
+                _tau_sev = float(_cascade_test_thresholds.get("tau_severe", 0.5))
+                _preds_casc = _predict_cascade(_cpd_t, _cps_t, _csl_t, _tau_dmg, _tau_sev)
+                casc_metrics = _make_eval_metrics_cascade(
+                    _preds_casc, _all_labels_t, _cascade_test_thresholds,
+                    temp_scale=_cascade_temp_scale,
+                )
+                with open(run_dir / "test_metrics_cascade.json", "w") as f:
+                    json.dump(casc_metrics, f, indent=2)
+                print(f"  [cascade]  macro_f1={casc_metrics['macro_f1']:.4f}  "
+                      f"FN_damage={casc_metrics['FN_damage']}  "
+                      f"FN_severe={casc_metrics['FN_severe']}  "
+                      f"recall_damage={casc_metrics['recall_damage']}  "
+                      f"recall_severe={casc_metrics['recall_severe']}")
+                _fn_casc_total = casc_metrics["FN_damage"] + casc_metrics["FN_severe"]
+                if _fn_casc_total == 0:
+                    print("  [cascade] FN_damage=0 FN_severe=0 -> never-miss achieved!")
+
+                # --- Cascade missed positives debug dump ---
+                _miss_rows_c = []
+                _lbl_arr_c   = np.asarray(_all_labels_t)
+                _prd_arr_c   = np.asarray(_preds_casc)
+                _miss_dmg_c  = np.isin(_lbl_arr_c, [1, 2, 3]) & (_prd_arr_c == 0)
+                _miss_sev_c  = np.isin(_lbl_arr_c, [2, 3]) & ~np.isin(_prd_arr_c, [2, 3])
+                _miss_mask_c = _miss_dmg_c | _miss_sev_c
+                if _miss_mask_c.any():
+                    for _mi in np.where(_miss_mask_c)[0]:
+                        _row = {
+                            "idx":            int(_mi),
+                            "true_label":     int(_lbl_arr_c[_mi]),
+                            "pred_label":     int(_prd_arr_c[_mi]),
+                            "p_damage":       round(float(_cpd_t[_mi]), 6),
+                            "p_severe":       round(float(_cps_t[_mi]), 6),
+                            "severity_probs": [round(float(v), 6) for v in
+                                               np.exp(_csl_t[_mi]) / np.exp(_csl_t[_mi]).sum()],
+                            "missed_damage":  bool(_miss_dmg_c[_mi]),
+                            "missed_severe":  bool(_miss_sev_c[_mi]),
+                        }
+                        if _mi < len(outer_test_recs):
+                            _row["tile_id"] = outer_test_recs[_mi].get("tile_id", "")
+                        _miss_rows_c.append(_row)
+                    _casc_miss_path = run_dir / "missed_positives_cascade.json"
+                    with open(_casc_miss_path, "w") as _f:
+                        json.dump(_miss_rows_c, _f, indent=2)
+                    print(f"  [cascade/debug] {len(_miss_rows_c)} missed -> {_casc_miss_path}")
+
+        # ================================================================
+        # NON-CASCADE outer-test eval (existing code, unchanged)
+        # ================================================================
+        else:
+            _all_probs_t, _all_labels_t = _infer_loader(outer_test_loader)
+
+            # --- crossfit_pool: pool calib preds from sibling folds ---
+            _test_thresholds = _thresholds   # default: use inner-split thresholds
+            if (_calib_mode == "crossfit_pool" and args.cv_fold is not None
+                    and args.cv_folds_path is not None):
+                print(f"  [crossfit_pool] Loading sibling-fold calib preds ...")
+                _pool_probs_list, _pool_labels_list = [], []
+                _cv_k = 5   # default; could introspect the folds JSON
+                try:
+                    with open(args.cv_folds_path) as _f:
+                        _fold_data_pool = json.load(_f)
+                        _cv_k = _fold_data_pool.get("k", 5)
+                except Exception:
+                    pass
+                for _sib in range(_cv_k):
+                    if _sib == args.cv_fold:
+                        continue   # exclude current fold to prevent leakage
+                    _sib_npz = Path(f"models/cv5/fold{_sib}") / "calib_preds.npz"
+                    if not _sib_npz.exists():
+                        # Try out_dir-relative path
+                        _out_base = Path(args.out_dir).parent
+                        _sib_npz = _out_base / f"fold{_sib}" / "calib_preds.npz"
+                    if _sib_npz.exists():
+                        _d = np.load(str(_sib_npz), allow_pickle=True)
+                        _pool_probs_list.append(_d["probs"])
+                        _pool_labels_list.append(_d["y_true"])
+                        print(f"    loaded fold{_sib}: {len(_d['y_true'])} samples")
+                    else:
+                        print(f"    WARNING: calib_preds.npz not found for fold{_sib} "
+                              f"({_sib_npz}) — skipping")
+                if _pool_probs_list:
+                    _pool_probs  = np.concatenate(_pool_probs_list,  axis=0)
+                    _pool_labels = np.concatenate(_pool_labels_list, axis=0)
+                    print(f"  [crossfit_pool] Pooled {len(_pool_labels)} calib samples from "
+                          f"{len(_pool_probs_list)} sibling folds. Refitting thresholds ...")
+                    _nm = bool(getattr(args, "never_miss_mode", 0))
+                    if args.threshold_policy == "per_class_threshold":
+                        _test_thresholds, _pool_summary = _fit_thresholds(
+                            _pool_probs, _pool_labels,
+                            args.target_recall_minor, args.target_recall_major,
+                            never_miss=_nm,
+                        )
+                    else:
+                        _test_thresholds, _pool_summary = _fit_thresholds_ordinal(
+                            _pool_probs, _pool_labels,
+                            target_recall_damage=args.target_recall_minor,
+                            target_recall_severe=args.target_recall_major,
+                            never_miss=_nm,
+                        )
+                    thr_pool_path = run_dir / "thresholds_crossfit.json"
+                    with open(thr_pool_path, "w") as _f:
+                        json.dump({
+                            "policy": args.threshold_policy,
+                            "thresholds": _test_thresholds,
+                            "calib_summary": _pool_summary,
+                            "n_pooled_samples": int(len(_pool_labels)),
+                            "sibling_folds": [s for s in range(_cv_k) if s != args.cv_fold],
+                        }, _f, indent=2)
+                    print(f"  [crossfit_pool] Saved {thr_pool_path}")
+                else:
+                    print("  [crossfit_pool] No sibling calib files found; "
+                          "falling back to inner-split thresholds.")
+
+            # --- Argmax metrics ---
+            _preds_argmax  = predict_with_policy(_all_probs_t, "argmax", None)
+            argmax_metrics = _make_eval_metrics_ordinal(
+                _preds_argmax, _all_labels_t, _all_probs_t, "argmax", None
+            )
+            with open(run_dir / "test_metrics_argmax.json", "w") as f:
+                json.dump(argmax_metrics, f, indent=2)
+            print(f"  [test/argmax]  macro_f1={argmax_metrics['macro_f1']:.4f}  "
+                  f"FN_minor={argmax_metrics['FN_minor_test']}  "
+                  f"FN_major={argmax_metrics['FN_major_test']}  "
+                  f"FN_damage={argmax_metrics['FN_damage']}  "
+                  f"FN_severe={argmax_metrics['FN_severe']}")
+
+            # --- Thresholded / ordinal metrics ---
+            if _test_thresholds is not None:
+                _policy = args.threshold_policy
+                _preds_thresh  = predict_with_policy(_all_probs_t, _policy, _test_thresholds)
+                thresh_metrics = _make_eval_metrics_ordinal(
+                    _preds_thresh, _all_labels_t, _all_probs_t, _policy, _test_thresholds
+                )
+                _out_fname = "test_metrics_ordinal.json" if _policy == "ordinal_threshold" \
+                             else "test_metrics_thresholded.json"
+                with open(run_dir / _out_fname, "w") as f:
+                    json.dump(thresh_metrics, f, indent=2)
+                print(f"  [test/{_policy}]  macro_f1={thresh_metrics['macro_f1']:.4f}  "
+                      f"FN_damage={thresh_metrics['FN_damage']}  "
+                      f"FN_severe={thresh_metrics['FN_severe']}  "
+                      f"recall_damage={thresh_metrics['recall_damage']}  "
+                      f"recall_severe={thresh_metrics['recall_severe']}")
+                _fn_total = thresh_metrics["FN_damage"] + thresh_metrics["FN_severe"]
+                if _fn_total == 0:
+                    print(f"  [{_policy}] FN_damage=0 FN_severe=0 -> never-miss achieved!")
+
+                # --- Debug dump of missed positives ---
+                _missed_rows = []
+                _labels_arr = np.asarray(_all_labels_t)
+                _preds_arr  = np.asarray(_preds_thresh)
+                _p_damage   = _all_probs_t[:, 1] + _all_probs_t[:, 2] + _all_probs_t[:, 3]
+                _p_severe   = _all_probs_t[:, 2] + _all_probs_t[:, 3]
+                # Missed damage: true label in {1,2,3} but predicted as 0
+                _miss_damage_mask = np.isin(_labels_arr, [1, 2, 3]) & (_preds_arr == 0)
+                # Missed severe: true label in {2,3} but predicted as not in {2,3}
+                _miss_severe_mask = np.isin(_labels_arr, [2, 3]) & ~np.isin(_preds_arr, [2, 3])
+                _missed_mask = _miss_damage_mask | _miss_severe_mask
+                if _missed_mask.any():
+                    _miss_idxs = np.where(_missed_mask)[0]
+                    for _mi in _miss_idxs:
+                        _row = {
+                            "idx":       int(_mi),
+                            "true_label": int(_labels_arr[_mi]),
+                            "pred_label": int(_preds_arr[_mi]),
+                            "p_no":       round(float(_all_probs_t[_mi, 0]), 6),
+                            "p_minor":    round(float(_all_probs_t[_mi, 1]), 6),
+                            "p_major":    round(float(_all_probs_t[_mi, 2]), 6),
+                            "p_destroyed": round(float(_all_probs_t[_mi, 3]), 6),
+                            "p_damage":   round(float(_p_damage[_mi]), 6),
+                            "p_severe":   round(float(_p_severe[_mi]), 6),
+                            "missed_damage": bool(_miss_damage_mask[_mi]),
+                            "missed_severe": bool(_miss_severe_mask[_mi]),
+                        }
+                        if outer_test_recs is not None and _mi < len(outer_test_recs):
+                            _row["tile_id"] = outer_test_recs[_mi].get("tile_id", "")
+                        _missed_rows.append(_row)
+                    _debug_path = run_dir / f"missed_positives_{_policy}.json"
+                    with open(_debug_path, "w") as _f:
+                        json.dump(_missed_rows, _f, indent=2)
+                    print(f"  [debug] {len(_missed_rows)} missed positives -> {_debug_path}")
+            else:
+                print("  [test] No thresholds fitted — only test_metrics_argmax.json written. "
+                      "Add --threshold_policy per_class_threshold or ordinal_threshold to also write "
+                      "test_metrics_thresholded.json / test_metrics_ordinal.json.")
 
 
 # ---------------------------------------------------------------------------
@@ -730,7 +2224,8 @@ def main() -> None:
     p.add_argument("--crops_dir",    default="data/processed/crops_oracle")
     p.add_argument("--out_dir",      default="models/six_channel")
     p.add_argument("--model_type",   default="six_channel",
-                   choices=["six_channel", "pre_post_diff", "siamese", "centroid_patch"])
+                   choices=["six_channel", "pre_post_diff", "siamese", "centroid_patch",
+                            "vit_finetune"])
     p.add_argument("--epochs",       type=int,   default=30)
     p.add_argument("--batch",        type=int,   default=32)
     p.add_argument("--lr",           type=float, default=3e-4)
@@ -778,6 +2273,20 @@ def main() -> None:
                    choices=["scratch", "pretrained"])
     p.add_argument("--pretrained_ckpt_path", type=str, default=None,
                    help="Encoder checkpoint path (required if init_mode=pretrained)")
+    # Step 6B — ViT fine-tuning controls (prevents catastrophic forgetting)
+    p.add_argument("--freeze_encoder", type=int, choices=[0, 1], default=0,
+                   help="Freeze encoder params after pretrained load (linear probe mode). "
+                        "Only affects models with .encoder attribute (e.g. vit_finetune). "
+                        "(default 0=off)")
+    p.add_argument("--encoder_lr_scale", type=float, default=1.0,
+                   help="LR multiplier for encoder vs head (e.g. 0.1 = 10x smaller LR for "
+                        "encoder, recommended for ViT fine-tuning). (default 1.0=same LR)")
+    p.add_argument("--freeze_epochs", type=int, default=0,
+                   help="Freeze encoder for first N epochs (head-only warm-up), then unfreeze "
+                        "with encoder_lr_scale. Implements FT0->FT1 staged fine-tune. (default 0=off)")
+    p.add_argument("--warmup_epochs", type=int, default=0,
+                   help="Linear LR warmup epochs before cosine schedule. Prevents large LR "
+                        "destroying pretrained features in early steps. (default 0=off)")
 
     # CV — fold-based train/val split (overrides default 80/20 when both are given)
     p.add_argument("--cv_folds_path", type=str, default=None,
@@ -785,11 +2294,107 @@ def main() -> None:
     p.add_argument("--cv_fold",       type=int, default=None,
                    help="Which fold to hold out as val (0..k-1)")
 
+    # Dataset integrity check
+    p.add_argument("--skip_dataset_check", type=int, choices=[0, 1], default=0,
+                   help="Skip SHA256 check of buildings_v2.csv vs dataset_manifest.json "
+                        "(default 0=strict; set 1 only when intentionally bypassing)")
+    p.add_argument("--use_raw_crops", type=int, choices=[0, 1], default=0,
+                   help="Load pre_raw.png/post_raw.png (no GT outline) instead of "
+                        "pre_bbox.png/post_bbox.png. Run make_oracle_crops.py first to "
+                        "backfill _raw.png files (default 0=outlined legacy crops).")
+
     # Disaster split — overrides both CV and default 80/20 when both are given
     p.add_argument("--train_disasters", type=str, default=None,
                    help="Comma-separated disaster IDs for train, e.g. socal-fire")
     p.add_argument("--val_disasters",   type=str, default=None,
                    help="Comma-separated disaster IDs for val, e.g. santa-rosa-wildfire")
+
+    # Long-tail losses (Deliverable A)
+    p.add_argument("--loss", type=str, default="ce",
+                   choices=["ce", "cb_ce", "focal", "ldam_drw"],
+                   help="Loss function: ce (default), cb_ce, focal, ldam_drw")
+    p.add_argument("--beta",            type=float, default=0.9999,
+                   help="CB beta for cb_ce / focal / ldam_drw DRW phase (default 0.9999)")
+    p.add_argument("--gamma",           type=float, default=2.0,
+                   help="Focal loss gamma (default 2.0)")
+    p.add_argument("--max_m",           type=float, default=0.5,
+                   help="LDAM max margin (default 0.5)")
+    p.add_argument("--ldam_s",          type=float, default=30.0,
+                   help="LDAM logit scale factor (default 30.0)")
+    p.add_argument("--drw_start_epoch", type=int,   default=10,
+                   help="DRW: epoch at which to switch to class-balanced weights (default 10)")
+
+    # Logit adjustment (Deliverable B)
+    p.add_argument("--logit_adjust",       type=str, default="none",
+                   choices=["none", "train_prior"],
+                   help="Logit adjustment at eval time (default none)")
+    p.add_argument("--logit_adjust_tau",   type=float, default=1.0,
+                   help="Logit adjustment tau (default 1.0)")
+    p.add_argument("--logit_adjust_train", type=int, choices=[0, 1], default=0,
+                   help="Apply logit adjustment during training loss (default 0=off)")
+
+    # Sampler mode (Deliverable C)
+    p.add_argument("--sampler_mode", type=str, default="invfreq",
+                   choices=["invfreq", "invfreq_capped", "class_quota_batch"],
+                   help="Sampler strategy when --use_sampler 1 (default invfreq)")
+    p.add_argument("--sampler_cap",  type=float, default=5.0,
+                   help="Per-sample weight cap multiplier for invfreq_capped (default 5.0)")
+
+    # Augmentations (Deliverable D)
+    p.add_argument("--aug_rotate90",     type=float, default=0.0,
+                   help="Probability of random 90/180/270 rotation (default 0.0=off)")
+    p.add_argument("--aug_affine",       type=float, default=0.0,
+                   help="Probability of small affine warp (default 0.0=off)")
+    p.add_argument("--aug_color_jitter", type=float, default=0.0,
+                   help="Probability of brightness/contrast jitter (default 0.0=off)")
+    p.add_argument("--aug_noise",        type=float, default=0.0,
+                   help="Probability of additive Gaussian noise (default 0.0=off)")
+
+    # Threshold policy (Deliverable E)
+    p.add_argument("--threshold_policy", type=str, default="argmax",
+                   choices=["argmax", "per_class_threshold", "ordinal_threshold",
+                            "cascade_threshold"],
+                   help="Prediction policy: argmax (default), per_class_threshold, "
+                        "ordinal_threshold, or cascade_threshold (requires --cascade_mode multihead)")
+    p.add_argument("--target_recall_minor", type=float, default=0.80,
+                   help="Target recall for minor-damage threshold (default 0.80)")
+    p.add_argument("--target_recall_major", type=float, default=0.80,
+                   help="Target recall for major-damage threshold (default 0.80)")
+
+    # Nested CV + never-miss mode (Deliverables A / C / D)
+    p.add_argument("--nested_cv",       type=int, choices=[0, 1], default=0,
+                   help="Nested CV: train on inner split, eval on outer fold; "
+                        "requires --cv_folds_path + --cv_fold (default 0)")
+    p.add_argument("--calib_fraction",  type=float, default=0.2,
+                   help="Fraction of outer-train tiles held for calibration (default 0.2)")
+    p.add_argument("--calib_seed",      type=int, default=None,
+                   help="RNG seed for calib split (default: same as --seed)")
+    p.add_argument("--selection_metric", type=str, default="macro_f1",
+                   help="Metric for best-checkpoint selection on calib set (default macro_f1)")
+    p.add_argument("--never_miss_mode", type=int, choices=[0, 1], default=0,
+                   help="Force target_recall=1.0 for minor+major (FN=0 mode) (default 0)")
+    p.add_argument("--calib_mode", type=str, default="inner_split",
+                   choices=["inner_split", "crossfit_pool"],
+                   help="Calibration mode: inner_split (default) or crossfit_pool "
+                        "(pool OOF preds from sibling folds for stable threshold fitting)")
+    p.add_argument("--eval_only", type=int, choices=[0, 1], default=0,
+                   help="Skip training; load existing best.pt and run outer-test eval only "
+                        "(use after all folds are trained with --calib_mode crossfit_pool)")
+
+    # Cascade mode (multi-head CNN, separate binary + severity heads)
+    p.add_argument("--cascade_mode", type=str, default="off",
+                   choices=["off", "multihead"],
+                   help="Cascade model mode: off (default) or multihead "
+                        "(shared backbone + damage/severe/severity heads)")
+    p.add_argument("--stage1_loss", type=str, default="bce",
+                   choices=["bce", "focal", "cb_bce"],
+                   help="Loss for binary damage/severe heads (default bce)")
+    p.add_argument("--stage2_loss", type=str, default="ce",
+                   choices=["ce", "cb_ce"],
+                   help="Loss for severity (3-class) head (default ce)")
+    p.add_argument("--temp_scale_stage1", type=int, choices=[0, 1], default=0,
+                   help="Fit temperature scalar for damage/severe heads before threshold fitting "
+                        "(default 0)")
 
     run(p.parse_args())
 

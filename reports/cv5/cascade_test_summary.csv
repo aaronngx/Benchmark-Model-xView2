@@ -1,0 +1,9 @@
+metric,mean,std,n_folds
+macro_f1,0.0755,0.0202,5
+f1_minor,0.0,0.0000,5
+f1_major,0.004,0.0090,5
+f1_dest,0.2978,0.0765,5
+FN_damage,0.0,0.0000,5
+FN_severe,0.0,0.0000,5
+FP_dmg_per_1k_no,999.844,0.3488,5
+FP_sev_per_1k_nonsevere,996.678,1.8393,5
