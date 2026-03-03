@@ -1,13 +1,3 @@
 run_id,source,split,cls,n_pos,n_nodmg,max_f1,top50_rec,top100_rec,@FP5_rec,@FP10_rec,@FP20_rec
-sampler_noweights_s1,checkpoint,reconstructed(seed=42),minor,18,1067,0.2759,0.3333,0.3333,0.2222,0.2222,0.2778
-sampler_noweights_s1,checkpoint,reconstructed(seed=42),major,6,1067,0.093,0.3333,0.3333,0.0,0.1667,0.3333
-sampler_noweights_s2,checkpoint,reconstructed(seed=42),minor,18,1067,0.087,0.1111,0.1667,0.0556,0.0556,0.0556
-sampler_noweights_s2,checkpoint,reconstructed(seed=42),major,6,1067,0.1739,0.3333,0.6667,0.1667,0.1667,0.3333
-sampler_noweights_s3,checkpoint,reconstructed(seed=42),minor,18,1067,0.2,0.2778,0.2778,0.0556,0.1667,0.2222
-sampler_noweights_s3,checkpoint,reconstructed(seed=42),major,6,1067,0.25,0.3333,0.3333,0.3333,0.3333,0.3333
-mae80_s1,checkpoint,reconstructed(seed=42),minor,18,1067,0.0968,0.1667,0.2222,0.0,0.0556,0.0556
-mae80_s1,checkpoint,reconstructed(seed=42),major,6,1067,0.1538,0.1667,0.1667,0.1667,0.1667,0.1667
-mae80_s2,checkpoint,reconstructed(seed=42),minor,18,1067,0.0488,0.0,0.0556,0.0,0.0,0.0
-mae80_s2,checkpoint,reconstructed(seed=42),major,6,1067,0.1053,0.3333,0.5,0.1667,0.1667,0.1667
-mae80_s3,checkpoint,reconstructed(seed=42),minor,18,1067,0.0769,0.1111,0.1111,0.0,0.0,0.0556
-mae80_s3,checkpoint,reconstructed(seed=42),major,6,1067,0.1176,0.1667,0.5,0.1667,0.1667,0.1667
+minor_cv,ensemble,cv_pooled_val_scores_csv,minor,47,6805,0.281,0.234,0.3617,0.234,0.3617,0.5106
+major_cv,ensemble,cv_pooled_val_scores_csv,major,44,6805,0.625,0.6591,0.8409,0.7955,0.8409,0.8636

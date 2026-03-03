@@ -45,26 +45,49 @@ def load_ensemble_scores(
     Z: np.ndarray,
     building_ids: np.ndarray,
 ) -> np.ndarray:
-    """Return ensemble mean score for each building (N,)."""
+    """Return ensemble mean score for each building (N,).
+
+    Two loading paths:
+    - member_*.pkl: per-member files (single-split mode) — scores Z rows in order
+    - val_scores.csv: pooled CV scores — aligns by building_id
+    """
     member_files = sorted(ensemble_dir.glob("member_*.pkl"))
-    if not member_files:
-        print(f"ERROR: no member_*.pkl in {ensemble_dir}", file=sys.stderr)
+    val_scores_csv = ensemble_dir / "val_scores.csv"
+
+    if member_files:
+        all_probs = []
+        for mf in member_files:
+            with open(mf, "rb") as f:
+                obj = pickle.load(f)
+            if isinstance(obj, tuple):
+                scaler, clf = obj
+                X = scaler.transform(Z)
+            else:
+                clf = obj
+                X = Z
+            prob = clf.predict_proba(X)[:, 1]
+            all_probs.append(prob)
+        return np.mean(all_probs, axis=0)   # (N,)
+
+    elif val_scores_csv.exists():
+        import csv as _csv
+        bid_to_score: dict = {}
+        with open(val_scores_csv, encoding="utf-8") as f:
+            for row in _csv.DictReader(f):
+                bid = f"{row['tile_id']}:{row['uid']}"
+                bid_to_score[bid] = float(row["raw_score"])
+        scores = np.array(
+            [bid_to_score.get(str(b), 0.0) for b in building_ids],
+            dtype=np.float32,
+        )
+        print(f"  Loaded {len(bid_to_score)} scores from val_scores.csv "
+              f"(matched {(scores > 0).sum()}/{len(scores)} buildings)")
+        return scores
+
+    else:
+        print(f"ERROR: no member_*.pkl or val_scores.csv in {ensemble_dir}",
+              file=sys.stderr)
         sys.exit(1)
-
-    all_probs = []
-    for mf in member_files:
-        with open(mf, "rb") as f:
-            obj = pickle.load(f)
-        if isinstance(obj, tuple):
-            scaler, clf = obj
-            X = scaler.transform(Z)
-        else:
-            clf = obj
-            X = Z
-        prob = clf.predict_proba(X)[:, 1]
-        all_probs.append(prob)
-
-    return np.mean(all_probs, axis=0)   # (N,)
 
 
 def cnn_scores_at_size(
@@ -156,19 +179,34 @@ def main() -> None:
     else:
         building_ids = np.array([f"{t}:{u}" for t, u in zip(tile_id, uid_arr)])
 
-    val_mask = (splits == "val")
-    Z_val    = Z[val_mask]
-    y_val    = label_idx[val_mask]
-    bids_val = building_ids[val_mask]
-    tid_val  = tile_id[val_mask]
-    uid_val  = uid_arr[val_mask]
+    ensemble_dir = Path(args.ensemble_dir)
+
+    # Use all buildings for CV pooled mode; single-split val otherwise
+    has_val_scores_csv = (ensemble_dir / "val_scores.csv").exists()
+    has_members        = bool(list(ensemble_dir.glob("member_*.pkl")))
+
+    if has_val_scores_csv and not has_members:
+        # CV pooled mode: all 8316 buildings have scores
+        Z_val    = Z
+        y_val    = label_idx
+        bids_val = building_ids
+        tid_val  = tile_id
+        uid_val  = uid_arr
+        print("  Using CV pooled val_scores.csv (all buildings)")
+    else:
+        val_mask = (splits == "val")
+        Z_val    = Z[val_mask]
+        y_val    = label_idx[val_mask]
+        bids_val = building_ids[val_mask]
+        tid_val  = tile_id[val_mask]
+        uid_val  = uid_arr[val_mask]
 
     n_minor_val = int((y_val == 1).sum())
-    print(f"Val buildings: {val_mask.sum()}  (minor={n_minor_val})")
+    print(f"Val buildings: {len(y_val)}  (minor={n_minor_val})")
 
     # ---------------------------------------------------------------- ensemble scores
-    ensemble_dir = Path(args.ensemble_dir)
-    print(f"\nScoring with ensemble ({len(list(ensemble_dir.glob('member_*.pkl')))} members)...")
+    n_members = len(list(ensemble_dir.glob("member_*.pkl")))
+    print(f"\nScoring with ensemble ({n_members} members, val_scores.csv={has_val_scores_csv})...")
     ens_scores = load_ensemble_scores(ensemble_dir, Z_val, bids_val)
 
     # Baseline recall before reranking

@@ -236,44 +236,81 @@ def eval_ensemble(
     cls: int,
     cls_name: str,
 ) -> list[dict]:
-    """Load LR ensemble, score all val buildings, return rows."""
+    """Load LR ensemble, score all val buildings, return rows.
+
+    Two loading paths:
+    - member_*.pkl: per-member files (old single-split mode)
+    - val_scores.csv: pooled CV scores (saved by run_ensemble_cv)
+      Aligns 4-class labels from embeddings_npz by building_id.
+    """
     import pickle
-    from sklearn.preprocessing import StandardScaler
 
     npz = np.load(embeddings_npz, allow_pickle=True)
-    Z          = npz["Z"].astype(np.float32)
     labels     = npz["label_idx"].astype(int)
     splits     = npz["split"]
 
-    val_mask = (splits == "val")
-    Z_val    = Z[val_mask]
-    y_val    = labels[val_mask]
+    # --- Path 1: val_scores.csv (CV pooled mode) ---
+    val_scores_csv = ensemble_dir / "val_scores.csv"
+    member_files   = sorted(ensemble_dir.glob("member_*.pkl"))
 
-    # Load ensemble members
-    member_files = sorted(ensemble_dir.glob("member_*.pkl"))
-    if not member_files:
-        print(f"  WARNING: no member_*.pkl in {ensemble_dir}")
-        return []
-
-    all_probs = []
-    for mf in member_files:
-        with open(mf, "rb") as f:
-            obj = pickle.load(f)
-        # obj may be (scaler, clf) tuple or just clf
-        if isinstance(obj, tuple):
-            scaler, clf = obj
-            X = scaler.transform(Z_val)
+    if not member_files and val_scores_csv.exists():
+        import csv as _csv
+        # Build building_id → 4-class label map from NPZ
+        if "building_id" in npz:
+            bid_arr = npz["building_id"]
         else:
-            clf = obj
-            X = Z_val
-        prob = clf.predict_proba(X)[:, 1]
-        all_probs.append(prob)
+            tile_ids = npz["tile_id"]
+            uids     = npz["uid"]
+            bid_arr  = np.array([f"{t}:{u}" for t, u in zip(tile_ids, uids)])
+        bid_to_label = {str(b): int(l) for b, l in zip(bid_arr, labels)}
 
-    scores = np.mean(all_probs, axis=0)
+        with open(val_scores_csv, encoding="utf-8") as f:
+            rows_csv = list(_csv.DictReader(f))
+
+        scores_list = []
+        y_list      = []
+        for r in rows_csv:
+            bid = f"{r['tile_id']}:{r['uid']}"
+            lab = bid_to_label.get(bid)
+            if lab is None:
+                continue
+            scores_list.append(float(r["raw_score"]))
+            y_list.append(lab)
+
+        scores = np.array(scores_list, dtype=np.float32)
+        y_val  = np.array(y_list, dtype=int)
+        split_label = "cv_pooled_val_scores_csv"
+
+    # --- Path 2: member_*.pkl (single-split mode) ---
+    elif member_files:
+        Z      = npz["Z"].astype(np.float32)
+        val_mask = (splits == "val")
+        Z_val    = Z[val_mask]
+        y_val    = labels[val_mask]
+
+        all_probs = []
+        for mf in member_files:
+            with open(mf, "rb") as f:
+                obj = pickle.load(f)
+            if isinstance(obj, tuple):
+                scaler, clf = obj
+                X = scaler.transform(Z_val)
+            else:
+                clf = obj
+                X = Z_val
+            prob = clf.predict_proba(X)[:, 1]
+            all_probs.append(prob)
+
+        scores      = np.mean(all_probs, axis=0)
+        split_label = "val_split_from_npz"
+
+    else:
+        print(f"  WARNING: no member_*.pkl or val_scores.csv in {ensemble_dir}")
+        return []
 
     m = compute_fp_budget_metrics(scores, y_val, cls)
     run_id = ensemble_dir.name
-    row = _format_row(run_id, "ensemble", "val_split_from_npz", cls_name, m)
+    row = _format_row(run_id, "ensemble", split_label, cls_name, m)
     return [row]
 
 
