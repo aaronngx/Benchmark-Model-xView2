@@ -1,0 +1,6 @@
+tile_id,uid,gt_label,pred_label,reasoning,latency_ms,tokens_used,model,parse_error
+santa-rosa-wildfire_00000000,46fafb6b-1493-4742-98f4-3d61ed1877d8,no-damage,no-damage,The building appears structurally intact with no visible changes in its structure or surroundings between the before and after images.,3819.4,17502,openai/gpt-4o-mini,
+santa-rosa-wildfire_00000000,c02898de-15c3-43fa-a05a-433a85ff78e5,no-damage,destroyed,"The second image shows a complete lack of structure where the building used to be, indicating significant destruction. The foundation and rubble are the only visible remnants.",2751.3,17505,openai/gpt-4o-mini,
+santa-rosa-wildfire_00000000,2703ea78-34dc-43af-a05b-0fa3bcd23999,no-damage,major-damage,"The second image shows significant structural collapse and debris around the building, indicating major damage has occurred since the disaster.",2539.8,17498,openai/gpt-4o-mini,
+santa-rosa-wildfire_00000000,1f786eab-9a9a-4cf3-89d7-ac32b782d253,no-damage,no-damage,Both images show the target building intact without any visible structural change or debris present.,3498.4,17496,openai/gpt-4o-mini,
+santa-rosa-wildfire_00000000,0d0103d4-bf4e-4143-8fe2-d772205dbab0,no-damage,no-damage,The building shows no visible structural changes between the two images. Both images appear similar.,49229.3,17497,openai/gpt-4o-mini,
