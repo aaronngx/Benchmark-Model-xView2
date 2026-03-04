@@ -1,0 +1,15 @@
+tile_id,uid,gt_label,pred_label,reasoning,latency_ms,tokens_used,model,parse_error,filter_applied
+socal-fire_00000238,1bea8bb6-afdb-42c1-9a92-73b49a5961ac,destroyed,no-damage,,0,0,meta/Llama-4-Scout-17B-16E-Instruct,,ensemble
+santa-rosa-wildfire_00000052,b1d60296-df8e-4e37-94cb-be42cc702983,destroyed,no-damage,,0,0,meta/Llama-4-Scout-17B-16E-Instruct,,ensemble
+santa-rosa-wildfire_00000052,0d070337-edb0-48de-951e-8cc8cc46409e,major-damage,destroyed,"The target building is no longer visible in the after image, indicating complete structural loss. Only rubble or foundation remains, classifying it as destroyed.",2256.3,637,meta/Llama-4-Scout-17B-16E-Instruct,,
+socal-fire_00000241,973edd1d-ed04-4733-bbb7-da70323bb6f0,minor-damage,no-damage,,0,0,meta/Llama-4-Scout-17B-16E-Instruct,,cnn
+socal-fire_00000241,7a21cbaa-7fde-4fde-9dc3-a8359e3baf11,major-damage,no-damage,,0,0,meta/Llama-4-Scout-17B-16E-Instruct,,cnn
+socal-fire_00000241,2c8aec0c-ddd7-45ad-a39d-4d4d60524847,minor-damage,no-damage,,0,0,meta/Llama-4-Scout-17B-16E-Instruct,,cnn
+socal-fire_00000241,2cb6847d-9921-489e-8d00-4f87e450a588,minor-damage,no-damage,,0,0,meta/Llama-4-Scout-17B-16E-Instruct,,ensemble
+socal-fire_00000241,334163cb-9715-461c-a964-50a15cb34a11,minor-damage,no-damage,,0,0,meta/Llama-4-Scout-17B-16E-Instruct,,ensemble
+socal-fire_00000241,3264468a-fe2d-442a-a528-4bc7651f94f7,minor-damage,no-damage,,0,0,meta/Llama-4-Scout-17B-16E-Instruct,,ensemble
+socal-fire_00000942,d627a97c-9f25-4e95-9f2f-dd75156a48fa,major-damage,no-damage,,0,0,meta/Llama-4-Scout-17B-16E-Instruct,,ensemble
+socal-fire_00000942,fa3b176d-c6ee-4d3d-8e00-f29a479b68d1,no-damage,no-damage,,0,0,meta/Llama-4-Scout-17B-16E-Instruct,,cnn
+socal-fire_00000942,9673d691-5129-4e3a-bf00-0f3cb272af7e,major-damage,no-damage,,0,0,meta/Llama-4-Scout-17B-16E-Instruct,,ensemble
+socal-fire_00000942,42cbcf8b-418c-46b0-b4dc-82f6455e3f8c,destroyed,no-damage,,0,0,meta/Llama-4-Scout-17B-16E-Instruct,,ensemble
+santa-rosa-wildfire_00000100,684d9f8a-4307-40e1-a6ac-0472c93c5793,minor-damage,destroyed,"The target building appears to have undergone complete structural loss, with only rubble and debris remaining. The before image shows a large building with a brown roof, while the after image reveals ",2060.8,653,meta/Llama-4-Scout-17B-16E-Instruct,,

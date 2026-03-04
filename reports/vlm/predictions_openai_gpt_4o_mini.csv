@@ -1,0 +1,6 @@
+tile_id,uid,gt_label,pred_label,reasoning,latency_ms,tokens_used,model,parse_error
+socal-fire_00000238,1bea8bb6-afdb-42c1-9a92-73b49a5961ac,destroyed,destroyed,"The after image shows significant structural loss with the building appearing to be in ruins, indicating it has been completely destroyed.",3099.9,17335,openai/gpt-4o-mini,
+santa-rosa-wildfire_00000052,b1d60296-df8e-4e37-94cb-be42cc702983,destroyed,destroyed,"The after image shows significant structural loss, with only remnants of the foundation and scattered rubble visible.",2577.9,17335,openai/gpt-4o-mini,
+santa-rosa-wildfire_00000052,0d070337-edb0-48de-951e-8cc8cc46409e,major-damage,destroyed,"The target building shows clear signs of complete structural loss, with only remnants visible in the after image.",2290.4,17332,openai/gpt-4o-mini,
+socal-fire_00000241,7a21cbaa-7fde-4fde-9dc3-a8359e3baf11,major-damage,minor-damage,"The after image shows visible damage to the roof, with debris nearby, indicating partial structural loss.",2417.8,17336,openai/gpt-4o-mini,
+socal-fire_00000241,2c8aec0c-ddd7-45ad-a39d-4d4d60524847,minor-damage,minor-damage,"The after image shows a partial roof collapse and some debris present around the building, indicating that it has experienced damage but is still standing.",49345.9,17344,openai/gpt-4o-mini,
