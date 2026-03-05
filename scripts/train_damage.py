@@ -74,6 +74,28 @@ def collate(batch):
     return xs, ys
 
 
+def _tta_predict(model, x_batch, n_views: int = 4):
+    """
+    Test-time augmentation: average softmax over n_views deterministic transforms.
+    n_views=4: rotations {0°, 90°, 180°, 270°}.
+    n_views=8: same + horizontal flip per rotation (8 views total).
+    Returns averaged probability tensor (B, 4) on the same device as x_batch.
+    Operates directly on GPU tensors — no CPU roundtrip.
+    """
+    import torch
+    probs_sum = torch.zeros(x_batch.size(0), 4, device=x_batch.device)
+    count = 0
+    for k in range(4):
+        x_rot = torch.rot90(x_batch, k, dims=[2, 3])
+        views = [x_rot]
+        if n_views == 8:
+            views.append(torch.flip(x_rot, dims=[3]))
+        for v in views:
+            probs_sum += torch.softmax(model(v), dim=1)
+            count += 1
+    return probs_sum / count
+
+
 def _compute_confusion_matrix(all_preds, all_labels, num_classes=4):
     """cm[true_class][pred_class] = count."""
     cm = np.zeros((num_classes, num_classes), dtype=np.int64)
@@ -1073,10 +1095,12 @@ def run(args: argparse.Namespace) -> None:
 
     else:
         aug_config = {
-            "rotate90":     args.aug_rotate90,
-            "affine":       args.aug_affine,
-            "color_jitter": args.aug_color_jitter,
-            "noise":        args.aug_noise,
+            "rotate90":           args.aug_rotate90,
+            "affine":             args.aug_affine,
+            "color_jitter":       args.aug_color_jitter,
+            "color_jitter_indep": args.aug_color_jitter_indep,
+            "noise":              args.aug_noise,
+            "class_conditional":  bool(args.aug_class_conditional),
         }
         if args.two_stage:
             train_ds_base    = CropDataset(s1_train_recs, size=args.size, augment=True,
@@ -1368,13 +1392,15 @@ def run(args: argparse.Namespace) -> None:
     last2_path = out_dir / "last_s2.pt"
 
     start_epoch = 1
-    best_val_f1 = -1.0
+    best_val_f1  = -1.0
+    best_sel_score = -1.0
 
     if best_path.exists() and args.resume:
         print(f"Resuming from {best_path} ...")
         ckpt_r = torch.load(str(best_path), map_location=device, weights_only=False)
         model.load_state_dict(ckpt_r["model_state_dict"])
-        best_val_f1 = ckpt_r.get("val_macro_f1", -1.0)
+        best_val_f1    = ckpt_r.get("val_macro_f1", -1.0)
+        best_sel_score = best_val_f1
         start_epoch = ckpt_r.get("epoch", 0) + 1
         print(f"  Resuming at epoch {start_epoch}, best_f1={best_val_f1:.4f}")
         if args.two_stage and model2 is not None and best2_path.exists():
@@ -1397,7 +1423,8 @@ def run(args: argparse.Namespace) -> None:
         print(f"[eval_only] Skipping training — loading {best_path}")
         ckpt_r = torch.load(str(best_path), map_location=device, weights_only=False)
         model.load_state_dict(ckpt_r["model_state_dict"])
-        best_val_f1 = ckpt_r.get("val_macro_f1", 0.0)
+        best_val_f1    = ckpt_r.get("val_macro_f1", 0.0)
+        best_sel_score = best_val_f1
         print(f"[eval_only] Checkpoint loaded (best_val_f1={best_val_f1:.4f})")
 
     # -----------------------------------------------------------------------
@@ -1530,13 +1557,17 @@ def run(args: argparse.Namespace) -> None:
                 elif args.two_stage and model2 is not None:
                     all_preds.extend(_two_stage_predict(x, model, model2, device))
                 else:
-                    logits = model(x)
-                    if _log_prior is not None:
-                        from disaster_bench.training.losses import logit_adjust as _la
-                        logits = _la(logits, _log_prior, tau=args.logit_adjust_tau)
-                        if args.logit_adjust_train and model.training:
-                            pass  # already applied above
-                    all_preds.extend(logits.argmax(1).cpu().tolist())
+                    if args.tta > 0:
+                        probs = _tta_predict(model, x, n_views=args.tta)
+                        all_preds.extend(probs.argmax(1).cpu().tolist())
+                    else:
+                        logits = model(x)
+                        if _log_prior is not None:
+                            from disaster_bench.training.losses import logit_adjust as _la
+                            logits = _la(logits, _log_prior, tau=args.logit_adjust_tau)
+                            if args.logit_adjust_train and model.training:
+                                pass  # already applied above
+                        all_preds.extend(logits.argmax(1).cpu().tolist())
                 all_labels.extend(y.tolist())
 
 
@@ -1599,8 +1630,14 @@ def run(args: argparse.Namespace) -> None:
                 jf.write(json.dumps(entry) + "\n")
 
         # --- Save best checkpoint ---
-        if macro_f1 > best_val_f1:
-            best_val_f1 = macro_f1
+        triage_recall = (recs_pc[1] + recs_pc[2]) / 2.0
+        _sel_score = (
+            triage_recall if getattr(args, "selection_metric", "macro_f1") == "triage_recall"
+            else macro_f1
+        )
+        if _sel_score > best_sel_score:
+            best_sel_score = _sel_score
+            best_val_f1    = macro_f1
             save_checkpoint(
                 model, str(best_path),
                 model_type=args.model_type,
@@ -1610,7 +1647,8 @@ def run(args: argparse.Namespace) -> None:
                 input_size=args.size,
                 num_classes=num_classes_s1,
             )
-            print(f"  -> saved best.pt (macro_f1={macro_f1:.4f})")
+            _metric_name = getattr(args, "selection_metric", "macro_f1")
+            print(f"  -> saved best.pt ({_metric_name}={_sel_score:.4f}, macro_f1={macro_f1:.4f})")
             if args.two_stage and model2 is not None:
                 save_checkpoint(
                     model2, str(best2_path),
@@ -1895,11 +1933,14 @@ def run(args: argparse.Namespace) -> None:
             "calib_mode":      _calib_mode,
             "thresholds":      _thresholds,
             "aug_config":      {
-                "rotate90":    args.aug_rotate90,
-                "affine":      args.aug_affine,
-                "color_jitter": args.aug_color_jitter,
-                "noise":       args.aug_noise,
+                "rotate90":           args.aug_rotate90,
+                "affine":             args.aug_affine,
+                "color_jitter":       args.aug_color_jitter,
+                "color_jitter_indep": args.aug_color_jitter_indep,
+                "noise":              args.aug_noise,
+                "class_conditional":  bool(args.aug_class_conditional),
             },
+            "tta": args.tta,
             "train_class_counts": {DAMAGE_CLASSES[i]: int(_tr_counts[i]) for i in range(4)},
             "train_class_prior":  {DAMAGE_CLASSES[i]: round(_tr_prior[i], 6) for i in range(4)},
             "best_val_macro_f1":  round(best_val_f1, 4),
@@ -2347,8 +2388,18 @@ def main() -> None:
                    help="Probability of small affine warp (default 0.0=off)")
     p.add_argument("--aug_color_jitter", type=float, default=0.0,
                    help="Probability of brightness/contrast jitter (default 0.0=off)")
-    p.add_argument("--aug_noise",        type=float, default=0.0,
+    p.add_argument("--aug_noise",              type=float, default=0.0,
                    help="Probability of additive Gaussian noise (default 0.0=off)")
+    p.add_argument("--aug_color_jitter_indep", type=float, default=0.0,
+                   help="Probability of INDEPENDENT brightness/contrast jitter per image "
+                        "(different random params for pre vs post; simulates real satellite "
+                        "acquisition differences; default 0.0=off)")
+    p.add_argument("--aug_class_conditional",  type=int, choices=[0, 1], default=0,
+                   help="Apply stronger aug to rare classes (minor=1, major=2): always "
+                        "flip/rotate/jitter regardless of probability flags (default 0=off)")
+    p.add_argument("--tta",                    type=int, choices=[0, 4, 8], default=0,
+                   help="Test-time augmentation views at eval: 0=off, 4=four rotations, "
+                        "8=four rotations + horizontal flip (default 0=off)")
 
     # Threshold policy (Deliverable E)
     p.add_argument("--threshold_policy", type=str, default="argmax",
@@ -2370,7 +2421,7 @@ def main() -> None:
     p.add_argument("--calib_seed",      type=int, default=None,
                    help="RNG seed for calib split (default: same as --seed)")
     p.add_argument("--selection_metric", type=str, default="macro_f1",
-                   help="Metric for best-checkpoint selection on calib set (default macro_f1)")
+                   help="Metric for best-checkpoint selection: macro_f1 (default) or triage_recall=(rec_minor+rec_major)/2")
     p.add_argument("--never_miss_mode", type=int, choices=[0, 1], default=0,
                    help="Force target_recall=1.0 for minor+major (FN=0 mode) (default 0)")
     p.add_argument("--calib_mode", type=str, default="inner_split",
