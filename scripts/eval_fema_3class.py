@@ -77,7 +77,7 @@ def eval_method(name: str, ckpt_path: str) -> dict:
 
     # Load val split (same split as training)
     records = build_crop_records(INDEX_CSV, CROPS_DIR)
-    _, val_recs = train_val_split(records)
+    _, val_recs = train_val_split(records, val_fraction=0.2, seed=42)
     val_ds = CropDataset(val_recs, size=IMG_SIZE, augment=False, preload=True)
     val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False,
                             collate_fn=collate, num_workers=0)

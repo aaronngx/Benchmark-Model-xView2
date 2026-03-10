@@ -52,6 +52,32 @@ import numpy as np
 
 
 # ---------------------------------------------------------------------------
+# Binary cascade label remap configs
+# Applied after train/val split to convert the 4-class problem into a binary
+# one for each stage.  filter_labels=None means "keep all buildings".
+# ---------------------------------------------------------------------------
+LABEL_REMAP_CONFIGS: dict = {
+    "s1_nodmg_vs_dmg": {
+        "remap":         {0: 0, 1: 1, 2: 1, 3: 1},  # no-damage=0, any-damage=1
+        "n_classes":     2,
+        "filter_labels": None,                         # use all 8316 buildings
+        "class_names":   ["no-damage", "any-damage"],
+    },
+    "s2_partial_vs_dest": {
+        "remap":         {1: 0, 2: 0, 3: 1},          # partial=0, destroyed=1
+        "n_classes":     2,
+        "filter_labels": {1, 2, 3},                    # skip no-damage buildings
+        "class_names":   ["partial-damage", "destroyed"],
+    },
+    "s3_minor_vs_major": {
+        "remap":         {1: 0, 2: 1},                 # minor=0, major=1
+        "n_classes":     2,
+        "filter_labels": {1, 2},                       # only 91 buildings
+        "class_names":   ["minor-damage", "major-damage"],
+    },
+}
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -74,16 +100,16 @@ def collate(batch):
     return xs, ys
 
 
-def _tta_predict(model, x_batch, n_views: int = 4):
+def _tta_predict(model, x_batch, n_views: int = 4, num_classes: int = 4):
     """
     Test-time augmentation: average softmax over n_views deterministic transforms.
     n_views=4: rotations {0°, 90°, 180°, 270°}.
     n_views=8: same + horizontal flip per rotation (8 views total).
-    Returns averaged probability tensor (B, 4) on the same device as x_batch.
+    Returns averaged probability tensor (B, num_classes) on the same device as x_batch.
     Operates directly on GPU tensors — no CPU roundtrip.
     """
     import torch
-    probs_sum = torch.zeros(x_batch.size(0), 4, device=x_batch.device)
+    probs_sum = torch.zeros(x_batch.size(0), num_classes, device=x_batch.device)
     count = 0
     for k in range(4):
         x_rot = torch.rot90(x_batch, k, dims=[2, 3])
@@ -963,6 +989,7 @@ def run(args: argparse.Namespace) -> None:
         run_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"Model type: {args.model_type}")
+    num_classes = 4  # default; overridden by --label_remap for binary cascade stages
 
     # -----------------------------------------------------------------------
     # Records
@@ -1042,6 +1069,29 @@ def run(args: argparse.Namespace) -> None:
         print(f"  Calib dist: { {cls: _ncv_dist.get(cls, 0) for cls in DAMAGE_CLASSES} }")
 
     # -----------------------------------------------------------------------
+    # Binary cascade label remap (--label_remap)
+    # Applied after all split logic so the same tile-grouped split is used.
+    # Sets num_classes to 2 for binary stages; all downstream code uses
+    # num_classes / num_classes_s1 rather than hardcoded 4.
+    # -----------------------------------------------------------------------
+    if args.label_remap != "none":
+        _rc = LABEL_REMAP_CONFIGS[args.label_remap]
+        filt  = _rc["filter_labels"]
+        remap = _rc["remap"]
+        if filt is not None:
+            train_recs = [r for r in train_recs if r["label_idx"] in filt]
+            val_recs   = [r for r in val_recs   if r["label_idx"] in filt]
+        train_recs = [dict(r, label_idx=remap[r["label_idx"]]) for r in train_recs]
+        val_recs   = [dict(r, label_idx=remap[r["label_idx"]]) for r in val_recs]
+        num_classes = _rc["n_classes"]
+        print(f"Label remap '{args.label_remap}': "
+              f"train={len(train_recs)}  val={len(val_recs)}  n_classes={num_classes}")
+        _tr_lbl = Counter(r["label_idx"] for r in train_recs)
+        _va_lbl = Counter(r["label_idx"] for r in val_recs)
+        print(f"  Train label dist: {dict(sorted(_tr_lbl.items()))}")
+        print(f"  Val   label dist: {dict(sorted(_va_lbl.items()))}")
+
+    # -----------------------------------------------------------------------
     # Step 5: two-stage label remapping
     # -----------------------------------------------------------------------
     S1_REMAP  = {0: 0, 1: 1, 2: 1, 3: 2}   # no-dmg=0, damaged(minor+major)=1, dest=2
@@ -1101,6 +1151,7 @@ def run(args: argparse.Namespace) -> None:
             "color_jitter_indep": args.aug_color_jitter_indep,
             "noise":              args.aug_noise,
             "class_conditional":  bool(args.aug_class_conditional),
+            "multiscale":         bool(getattr(args, "aug_multiscale", 0)),
         }
         if args.two_stage:
             train_ds_base    = CropDataset(s1_train_recs, size=args.size, augment=True,
@@ -1156,14 +1207,16 @@ def run(args: argparse.Namespace) -> None:
         s1_base_w_np = _compute_class_weights(s1_train_recs, 3,
                                                "normalized_invfreq", 0.0, 1e9)
     else:
-        # 4-class weights (existing behavior when --loss ce)
-        raw_w_np = _compute_class_weights(train_recs, 4,
+        # num_classes-class weights (4 by default; 2 for binary cascade stages)
+        raw_w_np = _compute_class_weights(train_recs, num_classes,
                                            args.weight_mode, args.w_min, args.w_max)
         weights  = torch.from_numpy(raw_w_np).float()
+        _wt_labels = (LABEL_REMAP_CONFIGS[args.label_remap]["class_names"]
+                      if args.label_remap != "none" else DAMAGE_CLASSES)
         print(f"Class weights ({args.weight_mode}): "
-              f"{ {c: round(float(w), 4) for c, w in zip(DAMAGE_CLASSES, weights)} }")
+              f"{ {c: round(float(w), 4) for c, w in zip(_wt_labels, weights)} }")
         # Base (unclipped) weights for sampler
-        base_w_np = _compute_class_weights(train_recs, 4, "normalized_invfreq", 0.0, 1e9)
+        base_w_np = _compute_class_weights(train_recs, num_classes, "normalized_invfreq", 0.0, 1e9)
 
     # -----------------------------------------------------------------------
     # New long-tail losses (cb_ce / focal / ldam_drw)
@@ -1192,7 +1245,7 @@ def run(args: argparse.Namespace) -> None:
     _log_prior = None
     if args.logit_adjust != "none" and not args.two_stage:
         from disaster_bench.training.losses import make_log_prior as _mlp
-        _log_prior = _mlp(train_recs, num_classes=4)
+        _log_prior = _mlp(train_recs, num_classes=num_classes)
         print(f"Logit adjustment: tau={args.logit_adjust_tau}  "
               f"prior={[round(float(p), 4) for p in _log_prior.exp().tolist()]}")
 
@@ -1271,9 +1324,9 @@ def run(args: argparse.Namespace) -> None:
         num_classes_s1 = 3
         num_classes_s2 = 2
     else:
-        model  = build_classifier(args.model_type, num_classes=4, dropout=args.dropout).to(device)
+        model  = build_classifier(args.model_type, num_classes=num_classes, dropout=args.dropout).to(device)
         model2 = None
-        num_classes_s1 = 4
+        num_classes_s1 = num_classes
         num_classes_s2 = None
 
     print(f"Parameters (Stage1): {sum(p.numel() for p in model.parameters()):,}")
@@ -1558,7 +1611,7 @@ def run(args: argparse.Namespace) -> None:
                     all_preds.extend(_two_stage_predict(x, model, model2, device))
                 else:
                     if args.tta > 0:
-                        probs = _tta_predict(model, x, n_views=args.tta)
+                        probs = _tta_predict(model, x, n_views=args.tta, num_classes=num_classes_s1 or 4)
                         all_preds.extend(probs.argmax(1).cpu().tolist())
                     else:
                         logits = model(x)
@@ -1571,7 +1624,8 @@ def run(args: argparse.Namespace) -> None:
                 all_labels.extend(y.tolist())
 
 
-        f1s, macro_f1, precs, recs_pc = _compute_val_metrics(all_preds, all_labels, num_classes=4)
+        _nc = num_classes_s1 or 4
+        f1s, macro_f1, precs, recs_pc = _compute_val_metrics(all_preds, all_labels, num_classes=_nc)
 
         # --- Print epoch summary ---
         s2_info = f" s2_loss={s2_loss_avg:.4f}" if s2_loss_avg is not None else ""
@@ -1585,26 +1639,29 @@ def run(args: argparse.Namespace) -> None:
             flush=True,
         )
 
-        # --- Step 0: extended val metrics block ---
-        cm = _compute_confusion_matrix(all_preds, all_labels, num_classes=4)
-        NO, MINOR, MAJOR = 0, 1, 2
-        N_no             = int(cm[NO].sum())
-        FP_minor_from_no = int(cm[NO][MINOR])
-        FP_major_from_no = int(cm[NO][MAJOR])
-        rate_minor       = 1000.0 * FP_minor_from_no / max(N_no, 1)
-        rate_major       = 1000.0 * FP_major_from_no / max(N_no, 1)
-        pred_minor       = int(cm[:, MINOR].sum())
-        pred_major       = int(cm[:, MAJOR].sum())
-
-        print(f"  FP/1k-no: minor={rate_minor:.1f}  major={rate_major:.1f} "
-              f"| pred_minor={pred_minor}  pred_major={pred_major}")
+        # --- Step 0: extended val metrics block (4-class only) ---
+        if _nc == 4:
+            cm = _compute_confusion_matrix(all_preds, all_labels, num_classes=4)
+            NO, MINOR, MAJOR = 0, 1, 2
+            N_no             = int(cm[NO].sum())
+            FP_minor_from_no = int(cm[NO][MINOR])
+            FP_major_from_no = int(cm[NO][MAJOR])
+            rate_minor       = 1000.0 * FP_minor_from_no / max(N_no, 1)
+            rate_major       = 1000.0 * FP_major_from_no / max(N_no, 1)
+            pred_minor       = int(cm[:, MINOR].sum())
+            pred_major       = int(cm[:, MAJOR].sum())
+            print(f"  FP/1k-no: minor={rate_minor:.1f}  major={rate_major:.1f} "
+                  f"| pred_minor={pred_minor}  pred_major={pred_major}")
+        else:
+            rate_minor, rate_major, pred_minor, pred_major = 0.0, 0.0, 0, 0
         cls_names = ["no", "minor", "major", "dest"]
         print("  " + "  ".join(
             f"{n}: P={precs[i]:.3f} R={recs_pc[i]:.3f} F1={f1s[i]:.3f}"
-            for i, n in enumerate(cls_names)
+            for i, n in enumerate(cls_names) if i < len(f1s)
         ), flush=True)
 
         # --- Step 0: write JSONL ---
+        _sf = lambda lst, i: round(lst[i], 4) if i < len(lst) else 0.0   # safe index
         if run_dir is not None:
             entry = {
                 "epoch":                 epoch,
@@ -1613,37 +1670,45 @@ def run(args: argparse.Namespace) -> None:
                 "pred_minor":            pred_minor,
                 "pred_major":            pred_major,
                 "macro_f1":              round(macro_f1, 4),
-                "f1_no":                 round(f1s[0], 4),
-                "f1_minor":              round(f1s[1], 4),
-                "f1_major":              round(f1s[2], 4),
-                "f1_dest":               round(f1s[3], 4),
-                "prec_no":               round(precs[0], 4),
-                "prec_minor":            round(precs[1], 4),
-                "prec_major":            round(precs[2], 4),
-                "prec_dest":             round(precs[3], 4),
-                "rec_no":                round(recs_pc[0], 4),
-                "rec_minor":             round(recs_pc[1], 4),
-                "rec_major":             round(recs_pc[2], 4),
-                "rec_dest":              round(recs_pc[3], 4),
+                "f1_no":                 _sf(f1s, 0),
+                "f1_minor":              _sf(f1s, 1),
+                "f1_major":              _sf(f1s, 2),
+                "f1_dest":               _sf(f1s, 3),
+                "prec_no":               _sf(precs, 0),
+                "prec_minor":            _sf(precs, 1),
+                "prec_major":            _sf(precs, 2),
+                "prec_dest":             _sf(precs, 3),
+                "rec_no":                _sf(recs_pc, 0),
+                "rec_minor":             _sf(recs_pc, 1),
+                "rec_major":             _sf(recs_pc, 2),
+                "rec_dest":              _sf(recs_pc, 3),
             }
             with open(run_dir / "val_metrics.jsonl", "a", encoding="utf-8") as jf:
                 jf.write(json.dumps(entry) + "\n")
 
         # --- Save best checkpoint ---
-        triage_recall = (recs_pc[1] + recs_pc[2]) / 2.0
-        _sel_score = (
-            triage_recall if getattr(args, "selection_metric", "macro_f1") == "triage_recall"
-            else macro_f1
-        )
+        triage_recall = (_sf(recs_pc, 1) + _sf(recs_pc, 2)) / 2.0
+        _sm = getattr(args, "selection_metric", "macro_f1")
+        if _sm == "triage_recall":
+            _sel_score = triage_recall
+        elif _sm == "recall_pos":
+            _sel_score = _sf(recs_pc, 1)   # recall of class 1 (positive class)
+        elif _sm == "recall_neg":
+            _sel_score = _sf(recs_pc, 0)   # recall of class 0 (negative class, e.g. partial-damage in S2)
+        else:
+            _sel_score = macro_f1
         if _sel_score > best_sel_score:
             best_sel_score = _sel_score
             best_val_f1    = macro_f1
+            _pc_labels = (LABEL_REMAP_CONFIGS[args.label_remap]["class_names"]
+                          if args.label_remap != "none" else DAMAGE_CLASSES)
             save_checkpoint(
                 model, str(best_path),
                 model_type=args.model_type,
                 epoch=epoch,
                 val_macro_f1=macro_f1,
-                per_class_f1={DAMAGE_CLASSES[i]: round(f1s[i], 4) for i in range(4)},
+                per_class_f1={_pc_labels[i]: round(f1s[i], 4)
+                              for i in range(min(_nc, len(_pc_labels)))},
                 input_size=args.size,
                 num_classes=num_classes_s1,
             )
@@ -1705,12 +1770,16 @@ def run(args: argparse.Namespace) -> None:
     # Save final checkpoints  (skipped in eval_only mode)
     # -----------------------------------------------------------------------
     if not _eval_only:
+        _pc_labels_last = (LABEL_REMAP_CONFIGS[args.label_remap]["class_names"]
+                           if args.label_remap != "none" else DAMAGE_CLASSES)
+        _nc_last = num_classes_s1 or 4
         save_checkpoint(
             model, str(last_path),
             model_type=args.model_type,
             epoch=args.epochs,
             val_macro_f1=macro_f1,
-            per_class_f1={DAMAGE_CLASSES[i]: round(f1s[i], 4) for i in range(4)},
+            per_class_f1={_pc_labels_last[i]: round(f1s[i], 4)
+                          for i in range(min(_nc_last, len(_pc_labels_last)))},
             input_size=args.size,
             num_classes=num_classes_s1,
         )
@@ -1912,8 +1981,11 @@ def run(args: argparse.Namespace) -> None:
     if run_dir is not None:
         from disaster_bench.training.losses import compute_class_counts as _cc, \
             compute_class_prior as _cp
-        _tr_counts = _cc(train_recs).tolist()
-        _tr_prior  = _cp(train_recs).tolist()
+        _sum_nc = num_classes
+        _tr_counts = _cc(train_recs, num_classes=_sum_nc).tolist()
+        _tr_prior  = _cp(train_recs, num_classes=_sum_nc).tolist()
+        _sum_labels = (LABEL_REMAP_CONFIGS[args.label_remap]["class_names"]
+                       if args.label_remap != "none" else list(DAMAGE_CLASSES[:_sum_nc]))
         summary = {
             "run_id":          args.run_id,
             "seed":            args.seed,
@@ -1941,8 +2013,8 @@ def run(args: argparse.Namespace) -> None:
                 "class_conditional":  bool(args.aug_class_conditional),
             },
             "tta": args.tta,
-            "train_class_counts": {DAMAGE_CLASSES[i]: int(_tr_counts[i]) for i in range(4)},
-            "train_class_prior":  {DAMAGE_CLASSES[i]: round(_tr_prior[i], 6) for i in range(4)},
+            "train_class_counts": {_sum_labels[i]: int(_tr_counts[i]) for i in range(_sum_nc)},
+            "train_class_prior":  {_sum_labels[i]: round(_tr_prior[i], 6) for i in range(_sum_nc)},
             "best_val_macro_f1":  round(best_val_f1, 4),
             "n_train":  len(train_recs),
             "n_val":    len(val_recs),
@@ -2421,7 +2493,20 @@ def main() -> None:
     p.add_argument("--calib_seed",      type=int, default=None,
                    help="RNG seed for calib split (default: same as --seed)")
     p.add_argument("--selection_metric", type=str, default="macro_f1",
-                   help="Metric for best-checkpoint selection: macro_f1 (default) or triage_recall=(rec_minor+rec_major)/2")
+                   help="Metric for best-checkpoint selection: macro_f1 (default), "
+                        "triage_recall=(rec_minor+rec_major)/2, "
+                        "recall_pos=recall of class 1 (positive class, for binary stages), "
+                        "recall_neg=recall of class 0 (negative class, e.g. partial-damage in S2)")
+
+    # Binary cascade label remap (new)
+    p.add_argument("--label_remap", type=str, default="none",
+                   choices=["none", "s1_nodmg_vs_dmg", "s2_partial_vs_dest", "s3_minor_vs_major"],
+                   help="Predefined label remap for binary cascade stages. "
+                        "Converts 4-class problem to binary and filters records accordingly. "
+                        "(default none=4-class as before)")
+    p.add_argument("--aug_multiscale", type=int, choices=[0, 1], default=0,
+                   help="Random multi-scale crop/pad augmentation (tight/normal/wide). "
+                        "Intended for Stage 3 (minor vs major, 91 buildings). (default 0=off)")
     p.add_argument("--never_miss_mode", type=int, choices=[0, 1], default=0,
                    help="Force target_recall=1.0 for minor+major (FN=0 mode) (default 0)")
     p.add_argument("--calib_mode", type=str, default="inner_split",

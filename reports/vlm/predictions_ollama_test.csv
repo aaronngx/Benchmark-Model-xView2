@@ -1,0 +1,6 @@
+tile_id,uid,gt_label,pred_label,reasoning,key_evidence,considered_classes,destroyed_gate_passed,why_not_destroyed,why_destroyed,confidence,latency_ms,tokens_used,model,parse_error,filter_applied
+santa-rosa-wildfire_00000001,ea7c243e-d1eb-4609-968b-deef639d1bb3,no-damage,no-damage,,,,,,,,19954.9,0,ollama/llava:7b,,
+santa-rosa-wildfire_00000012,dd37683a-5e21-4eca-a08a-704b10c7f560,destroyed,no-damage,,,,,,,,19197.5,0,ollama/llava:7b,,
+santa-rosa-wildfire_00000012,5a65a158-8cdc-44c5-b397-b29dabaa17c8,no-damage,no-damage,,,,,,,,19200.4,0,ollama/llava:7b,,
+santa-rosa-wildfire_00000019,01736adb-a309-4859-b55d-91a1be740893,no-damage,no-damage,,,,,,,,19222.2,0,ollama/llava:7b,,
+santa-rosa-wildfire_00000028,9c8d4526-29be-4fa0-a8d1-6f3bb23dd990,destroyed,no-damage,,,,,,,,19394.7,0,ollama/llava:7b,,

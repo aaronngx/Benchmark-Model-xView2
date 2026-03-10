@@ -1,0 +1,1 @@
+tile_id,uid,gt_label,pred_label,reasoning,key_evidence,considered_classes,destroyed_gate_passed,why_not_destroyed,why_destroyed,confidence,latency_ms,tokens_used,model,parse_error,filter_applied
